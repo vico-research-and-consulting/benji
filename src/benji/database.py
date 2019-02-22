@@ -32,7 +32,7 @@ from sqlalchemy import Column, String, Integer, BigInteger, ForeignKey, LargeBin
     DateTime, UniqueConstraint, and_, or_, not_, MetaData, Table, CheckConstraint
 from sqlalchemy import distinct
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.declarative import declarative_base, DeclarativeMeta
 from sqlalchemy.ext.mutable import MutableComposite
 from sqlalchemy.orm import sessionmaker, composite, CompositeProperty
@@ -535,10 +535,10 @@ class DatabaseBackend(ReprMixIn):
                 # Increase the timeout (5 seconds is the default). This will make "database is locked" errors
                 # due to concurrent database access less likely.
                 connect_args['timeout'] = 3 * self._BLOCKS_COMMIT_INTERVAL
-            self.engine = sqlalchemy.create_engine(url, connect_args=connect_args)
+            self._engine = sqlalchemy.create_engine(url, connect_args=connect_args)
         else:
             logger.info('Running with ephemeral in-memory database.')
-            self.engine = sqlalchemy.create_engine('sqlite://')
+            self._engine = sqlalchemy.create_engine('sqlite://')
 
     def _alembic_config(self):
         return alembic_config_Config(
@@ -546,10 +546,10 @@ class DatabaseBackend(ReprMixIn):
 
     def _database_tables(self) -> List[str]:
         # Need to ignore internal SQLite table here
-        return [table for table in self.engine.table_names() if table != 'sqlite_sequence']
+        return [table for table in self._engine.table_names() if table != 'sqlite_sequence']
 
     def _migration_needed(self, alembic_config: alembic_config_Config) -> Tuple[bool, str, str]:
-        with self.engine.begin() as connection:
+        with self._engine.begin() as connection:
             alembic_config.attributes['connection'] = connection
             script = ScriptDirectory.from_config(alembic_config)
             with EnvironmentContext(alembic_config, script) as env_context:
@@ -575,7 +575,7 @@ class DatabaseBackend(ReprMixIn):
         migration_needed, current_revision, head_revision = self._migration_needed(alembic_config)
         if migration_needed:
             logger.info('Migrating from database schema revision {} to {}.'.format(current_revision, head_revision))
-            with self.engine.begin() as connection:
+            with self._engine.begin() as connection:
                 alembic_config.attributes['connection'] = connection
                 alembic_command.upgrade(alembic_config, "head")
         else:
@@ -599,7 +599,7 @@ class DatabaseBackend(ReprMixIn):
                 cursor.execute("PRAGMA foreign_keys=ON")
                 cursor.close()
 
-        Session = sessionmaker(bind=self.engine)
+        Session = sessionmaker(bind=self._engine)
         self._session = Session()
         self._locking = DatabaseBackendLocking(self._session)
         self._last_blocks_commit = time.monotonic()
@@ -608,21 +608,21 @@ class DatabaseBackend(ReprMixIn):
     def init(self, _destroy: bool = False) -> None:
         # This is dangerous and is only used by the test suite to get a clean slate
         if _destroy:
-            Base.metadata.drop_all(self.engine)
+            Base.metadata.drop_all(self._engine)
             # Drop alembic_version table
-            if self.engine.has_table('alembic_version'):
-                with self.engine.begin() as connection:
+            if self._engine.has_table('alembic_version'):
+                with self._engine.begin() as connection:
                     connection.execute(DropTable(Table('alembic_version', MetaData())))  # type: ignore
 
         table_names = self._database_tables()
         if not table_names:
-            Base.metadata.create_all(self.engine, checkfirst=False)
+            Base.metadata.create_all(self._engine, checkfirst=False)
         else:
             logger.debug('Existing tables: {}'.format(', '.join(sorted(table_names))))
             raise FileExistsError('Database schema contains tables already. Not touching anything.')
 
         alembic_config = self._alembic_config()
-        with self.engine.begin() as connection:
+        with self._engine.begin() as connection:
             alembic_config.attributes['connection'] = connection
             alembic_command.stamp(alembic_config, "head")
 
@@ -940,7 +940,10 @@ class DatabaseBackend(ReprMixIn):
                 for uids in hit_list.values():
                     self._session.query(DeletedBlock).filter(
                         DeletedBlock.uid.in_(uids)).delete(synchronize_session=False)
-                yield (hit_list)
+                yield hit_list
+                # We expect that the caller has handled all the blocks returned so far, so we can call commit after
+                # the yield to keep the transaction small.
+                self._session.commit()
 
         self._session.commit()
         logger.info("Cleanup: Cleanup finished. {} false positives, {} data deletions.".format(
@@ -1128,7 +1131,8 @@ class DatabaseBackend(ReprMixIn):
             except KeyError:
                 pass  # does not exist
             else:
-                raise FileExistsError('Version {} already exists and cannot be imported.'.format(version_dict['uid']))
+                raise FileExistsError('Version {} already exists and so cannot be imported.'.format(
+                    version_uid.v_string))
 
             version = Version(
                 uid=version_uid,
@@ -1169,6 +1173,8 @@ class DatabaseBackend(ReprMixIn):
         self._locking.unlock_all()
         self._locking = None
         self._session.close()
+        self._session = None
+        self._engine.dispose()
 
 
 class DatabaseBackendLocking:
@@ -1178,9 +1184,10 @@ class DatabaseBackendLocking:
         self._host = platform.node()
         self._uuid = uuid.uuid1().hex
 
-    def lock(self, *, lock_name: str, reason: str = None, locked_msg: str = None):
+    def lock(self, *, lock_name: str, reason: str = None, locked_msg: str = None, override_lock: bool = False):
         try:
-            lock = self._session.query(Lock).filter_by(host=self._host, lock_name=lock_name, process_id=self._uuid).first()
+            lock = self._session.query(Lock).filter_by(
+                host=self._host, lock_name=lock_name, process_id=self._uuid).first()
             if lock is not None:
                 raise InternalError('Attempt to acquire lock {} twice.'.format(lock_name))
             lock = Lock(
@@ -1190,14 +1197,18 @@ class DatabaseBackendLocking:
                 reason=reason,
                 date=datetime.datetime.utcnow(),
             )
-            self._session.add(lock)
+            if override_lock:
+                logger.warn('Will override any existing lock.')
+                self._session.merge(lock, load=True)
+            else:
+                self._session.add(lock)
             self._session.commit()
-        except SQLAlchemyError:  # this is actually too broad and will also include other errors
+        except IntegrityError:
             self._session.rollback()
             if locked_msg is not None:
-                raise AlreadyLocked(locked_msg)
+                raise AlreadyLocked(locked_msg) from None
             else:
-                raise AlreadyLocked('Lock {} is already taken.'.format(lock_name))
+                raise AlreadyLocked('Lock {} is already taken.'.format(lock_name)) from None
         except:
             self._session.rollback()
             raise
@@ -1245,11 +1256,12 @@ class DatabaseBackendLocking:
         except:
             pass
 
-    def lock_version(self, version_uid: VersionUid, reason: str = None) -> None:
+    def lock_version(self, version_uid: VersionUid, reason: str = None, override_lock: bool = False) -> None:
         self.lock(
             lock_name=version_uid.v_string,
             reason=reason,
-            locked_msg='Version {} is already locked.'.format(version_uid.v_string))
+            locked_msg='Version {} is already locked.'.format(version_uid.v_string),
+            override_lock=override_lock)
 
     def is_version_locked(self, version_uid: VersionUid) -> bool:
         return self.is_locked(lock_name=version_uid.v_string)
@@ -1266,8 +1278,9 @@ class DatabaseBackendLocking:
                   lock_name: str,
                   reason: str = None,
                   locked_msg: str = None,
-                  unlock: bool = True) -> Iterator[None]:
-        self.lock(lock_name=lock_name, reason=reason, locked_msg=locked_msg)
+                  unlock: bool = True,
+                  override_lock: bool = False) -> Iterator[None]:
+        self.lock(lock_name=lock_name, reason=reason, locked_msg=locked_msg, override_lock=override_lock)
         try:
             yield
         except:
@@ -1278,8 +1291,12 @@ class DatabaseBackendLocking:
                 self.unlock(lock_name=lock_name)
 
     @contextmanager
-    def with_version_lock(self, version_uid: VersionUid, reason: str = None, unlock: bool = True) -> Iterator[None]:
-        self.lock_version(version_uid, reason=reason)
+    def with_version_lock(self,
+                          version_uid: VersionUid,
+                          reason: str = None,
+                          unlock: bool = True,
+                          override_lock: bool = False) -> Iterator[None]:
+        self.lock_version(version_uid, reason=reason, override_lock=override_lock)
         try:
             yield
         except:

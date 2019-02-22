@@ -203,8 +203,8 @@ class Benji(ReprMixIn):
                 self._process_name, 'Preparing {} of version {} ({:.1f}%)'.format(
                     'deep-scrub' if deep_scrub else 'scrub', version.uid.v_string, (i + 1) / len(blocks) * 100))
             if not block.uid:
-                logger.debug('{} of block {} (UID {}) skipped (sparse).'.format(
-                    'Deep -scrub' if deep_scrub else 'Scrub', block.id, block.uid))
+                logger.debug('{} of block {} (UID {}) skipped (sparse).'.format('Deep-scrub' if deep_scrub else 'Scrub',
+                                                                                block.id, block.uid))
                 continue
             if history and history.seen(version.storage_id, block.uid):
                 logger.debug('{} of block {} (UID {}) skipped (already seen).'.format(
@@ -584,8 +584,9 @@ class Benji(ReprMixIn):
            version_uid: VersionUid,
            force: bool = True,
            disallow_rm_when_younger_than_days: int = 0,
-           keep_metadata_backup: bool = False) -> None:
-        with self._locking.with_version_lock(version_uid, reason='Removing version'):
+           keep_metadata_backup: bool = False,
+           override_lock: bool = False) -> None:
+        with self._locking.with_version_lock(version_uid, reason='Removing version', override_lock=override_lock):
             version = self._database_backend.get_version(version_uid)
 
             if version.protected:
@@ -812,14 +813,14 @@ class Benji(ReprMixIn):
                 else:
                     block.uid = BlockUid(version.uid.integer, block.id + 1)
                     block.checksum = data_checksum
-                    storage.save(block, data)
+                    storage.write(block, data)
                     write_jobs += 1
                     logger.debug('Queued block {} for write (checksum {}...)'.format(block.id, data_checksum[:16]))
 
                 done_read_jobs += 1
 
                 try:
-                    for saved_block in storage.save_get_completed(timeout=0):
+                    for saved_block in storage.write_get_completed(timeout=0):
                         if isinstance(saved_block, Exception):
                             raise saved_block
 
@@ -845,7 +846,7 @@ class Benji(ReprMixIn):
                                                                           done_read_jobs / read_jobs * 100))
 
             try:
-                for saved_block in storage.save_get_completed():
+                for saved_block in storage.write_get_completed():
                     if isinstance(saved_block, Exception):
                         raise saved_block
 
@@ -864,6 +865,7 @@ class Benji(ReprMixIn):
                 pass
 
         except:
+            self._locking.unlock_version(version.uid)
             raise
         finally:
             # This will also cancel any outstanding read jobs
@@ -906,9 +908,13 @@ class Benji(ReprMixIn):
         logger.info('New version {} created, backup successful.'.format(version.uid.v_string))
         return version
 
-    def cleanup(self, dt: int = 3600) -> None:
+    def cleanup(self, dt: int = 3600, override_lock: bool = False) -> None:
         with self._locking.with_lock(
-                lock_name='cleanup', reason='Cleanup', locked_msg='Another cleanup is already running.'):
+                lock_name='cleanup',
+                reason='Cleanup',
+                locked_msg='Another cleanup is already running.',
+                override_lock=override_lock):
+            notify(self._process_name, 'Cleanup')
             for hit_list in self._database_backend.get_delete_candidates(dt):
                 for storage_id, uids in hit_list.items():
                     storage = StorageFactory.get_by_storage_id(storage_id)
@@ -918,6 +924,7 @@ class Benji(ReprMixIn):
                     if no_del_uids:
                         logger.info('Unable to delete these UIDs from storage {}: {}'.format(
                             storage.name, ', '.join([str(uid) for uid in no_del_uids])))
+            notify(self._process_name)
 
     def add_label(self, version_uid: VersionUid, key: str, value: str) -> None:
         self._database_backend.add_label(version_uid, key, value)
@@ -959,8 +966,8 @@ class Benji(ReprMixIn):
                 with StringIO() as metadata_export:
                     self._database_backend.export([version.uid], metadata_export)
                     storage = StorageFactory.get_by_storage_id(version.storage_id)
-                    storage.save_version(version.uid, metadata_export.getvalue(), overwrite=overwrite)
-                logger.info('Backed up version {} metadata.'.format(version.uid.v_string))
+                    storage.write_version(version.uid, metadata_export.getvalue(), overwrite=overwrite)
+                logger.info('Backed up metadata of version {}.'.format(version.uid.v_string))
         finally:
             for version_uid in locked_version_uids:
                 self._locking.unlock_version(version_uid)
@@ -971,8 +978,8 @@ class Benji(ReprMixIn):
     def metadata_import(self, f: TextIO) -> None:
         # TODO: Find a good way to lock here
         version_uids = self._database_backend.import_(f)
-        for version_uid in version_uids:
-            logger.info('Imported version {} metadata.'.format(version_uid.v_string))
+        logger.info('Imported metadata of version(s): {}.'.format(', '.join(
+            [version_uid.v_string for version_uid in version_uids])))
 
     def metadata_restore(self, version_uids: Sequence[VersionUid], storage_name: str = None) -> None:
         if storage_name is not None:
@@ -986,11 +993,10 @@ class Benji(ReprMixIn):
                 locked_version_uids.append(version_uid)
 
             for version_uid in version_uids:
-
                 metadata_import_data = storage.read_version(version_uid)
                 with StringIO(metadata_import_data) as metadata_import:
                     self._database_backend.import_(metadata_import)
-                logger.info('Restored version {} metadata.'.format(version_uid.v_string))
+                logger.info('Restored metadata of version {}.'.format(version_uid.v_string))
         finally:
             for version_uid in locked_version_uids:
                 self._locking.unlock_version(version_uid)
@@ -1294,7 +1300,7 @@ class BenjiStore(ReprMixIn):
                 block.checksum = None
                 block.uid = BlockUid(None, None)
             else:
-                storage.save_sync(block, data)
+                storage.write_sync(block, data)
                 self._block_cache.rm(block.uid)
 
             try:
