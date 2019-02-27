@@ -21,7 +21,7 @@ from benji.factory import IOFactory, StorageFactory
 from benji.logging import logger
 from benji.repr import ReprMixIn
 from benji.retentionfilter import RetentionFilter
-from benji.storage.base import InvalidBlockException
+from benji.storage.base import InvalidBlockException, BlockNotFoundError
 from benji.utils import notify, BlockHash
 
 
@@ -215,7 +215,7 @@ class Benji(ReprMixIn):
                 logger.debug('{} of block {} (UID {}) skipped (percentile is {}).'.format(
                     'Deep-scrub' if deep_scrub else 'Scrub', block.id, block.uid, block_percentage))
             else:
-                storage.read(block, metadata_only=(not deep_scrub))
+                storage.read_block_async(block, metadata_only=(not deep_scrub))
                 read_jobs += 1
         return read_jobs
 
@@ -424,7 +424,8 @@ class Benji(ReprMixIn):
             if source_mismatch:
                 logger.error('Version {} had source mismatches.'.format(version_uid.v_string))
             logger.error('Marked version {} as invalid because it has errors.'.format(version_uid.v_string))
-            affected_version_uids.remove(version_uid)
+            if version_uid in affected_version_uids:
+                affected_version_uids.remove(version_uid)
             if affected_version_uids:
                 logger.error('Marked the following versions as invalid, too, because of invalid blocks: {}.' \
                              .format(', '.join([affected_version.v_string for affected_version in sorted(affected_version_uids)])))
@@ -498,26 +499,76 @@ class Benji(ReprMixIn):
 
         try:
             storage = StorageFactory.get_by_storage_id(version.storage_id)
-            read_jobs = 0
-            for i, block in enumerate(blocks):
+
+            read_blocks = 0
+            sparse_blocks = 0
+            for block in blocks:
                 if block.uid:
-                    storage.read(block)
+                    read_blocks += 1
+                else:
+                    sparse_blocks += 1
+
+            read_jobs = 0
+            write_jobs = 0
+            done_write_jobs = 0
+            log_every_jobs = (sparse_blocks if not sparse else read_blocks) // 200 + 1  # about every half percent
+            sparse_data_block = b'\0' * block.size
+            for block in blocks:
+                if block.uid:
+                    storage.read_block_async(block)
                     read_jobs += 1
+                    logger.debug('Queued read for block {} successfully ({} bytes).'.format(block.id, block.size))
                 elif not sparse:
-                    io.write(block, b'\0' * block.size)
-                    logger.debug('Restored sparse block {} successfully ({} bytes).'.format(block.id, block.size))
+                    io.write(block, sparse_data_block)
+                    write_jobs += 1
+                    logger.debug('Queued write for sparse block {} successfully ({} bytes).'.format(
+                        block.id, block.size))
                 else:
                     logger.debug('Ignored sparse block {}.'.format(block.id))
+
                 if sparse:
                     notify(
                         self._process_name, 'Restoring version {} to {}: Queueing blocks to read ({:.1f}%)'.format(
-                            version_uid.v_string, target, (i + 1) / len(blocks) * 100))
+                            version_uid.v_string, target, read_jobs / read_blocks * 100))
                 else:
+                    try:
+                        for written_block in io.write_get_completed(timeout=0):
+                            if isinstance(written_block, Exception):
+                                raise written_block
+                            done_write_jobs += 1
+
+                            notify(
+                                self._process_name, 'Restoring version {} to {}: Sparse writing ({:.1f}%)'.format(
+                                    version_uid.v_string, target, done_write_jobs / sparse_blocks * 100))
+                            if done_write_jobs % log_every_jobs == 0 or done_write_jobs == sparse_blocks:
+                                logger.info('Wrote sparse {}/{} blocks ({:.1f}%)'.format(
+                                    done_write_jobs, sparse_blocks, done_write_jobs / sparse_blocks * 100))
+                    except (TimeoutError, CancelledError):
+                        pass
+
+            try:
+                for written_block in io.write_get_completed():
+                    if isinstance(written_block, Exception):
+                        raise written_block
+                    done_write_jobs += 1
+
                     notify(
                         self._process_name, 'Restoring version {} to {}: Sparse writing ({:.1f}%)'.format(
-                            version_uid.v_string, target, (i + 1) / len(blocks) * 100))
+                            version_uid.v_string, target, done_write_jobs / sparse_blocks * 100))
+                    if done_write_jobs % log_every_jobs == 0 or done_write_jobs == sparse_blocks:
+                        logger.info('Wrote sparse {}/{} blocks ({:.1f}%)'.format(done_write_jobs, sparse_blocks,
+                                                                                 done_write_jobs / sparse_blocks * 100))
+            except CancelledError:
+                pass
+
+            if write_jobs != done_write_jobs:
+                raise InternalError(
+                    'Number of submitted and completed write jobs inconsistent (submitted: {}, completed {}).'.format(
+                        write_jobs, done_write_jobs))
 
             done_read_jobs = 0
+            write_jobs = 0
+            done_write_jobs = 0
             log_every_jobs = read_jobs // 200 + 1  # about every half percent
             for entry in storage.read_get_completed():
                 done_read_jobs += 1
@@ -534,6 +585,7 @@ class Benji(ReprMixIn):
 
                 # Write what we have
                 io.write(block, data)
+                write_jobs += 1
 
                 try:
                     storage.check_block_metadata(block=block, data_length=len(data), metadata=metadata)
@@ -554,12 +606,36 @@ class Benji(ReprMixIn):
                 else:
                     logger.debug('Restored block {} successfully ({} bytes).'.format(block.id, block.size))
 
-                notify(
-                    self._process_name, 'Restoring version {} to {} ({:.1f}%)'.format(
-                        version_uid.v_string, target, done_read_jobs / read_jobs * 100))
-                if i % log_every_jobs == 0 or done_read_jobs == read_jobs:
-                    logger.info('Restored {}/{} blocks ({:.1f}%)'.format(done_read_jobs, read_jobs,
-                                                                         done_read_jobs / read_jobs * 100))
+                try:
+                    for written_block in io.write_get_completed(timeout=0):
+                        if isinstance(written_block, Exception):
+                            raise written_block
+                        done_write_jobs += 1
+
+                        notify(
+                            self._process_name, 'Restoring version {} to {} ({:.1f}%)'.format(
+                                version_uid.v_string, target, done_write_jobs / read_jobs * 100))
+                        if done_write_jobs % log_every_jobs == 0 or done_write_jobs == read_jobs:
+                            logger.info('Restored {}/{} blocks ({:.1f}%)'.format(done_write_jobs, read_jobs,
+                                                                                 done_write_jobs / read_jobs * 100))
+                except (TimeoutError, CancelledError):
+                    pass
+
+            try:
+                for written_block in io.write_get_completed():
+                    if isinstance(written_block, Exception):
+                        raise written_block
+                    done_write_jobs += 1
+
+                    notify(
+                        self._process_name, 'Restoring version {} to {} ({:.1f}%)'.format(
+                            version_uid.v_string, target, done_write_jobs / read_jobs * 100))
+                    if done_write_jobs % log_every_jobs == 0 or done_write_jobs == read_jobs:
+                        logger.info('Restored {}/{} blocks ({:.1f}%)'.format(done_write_jobs, read_jobs,
+                                                                             done_write_jobs / read_jobs * 100))
+            except CancelledError:
+                pass
+
         except:
             raise
         finally:
@@ -571,6 +647,11 @@ class Benji(ReprMixIn):
             raise InternalError(
                 'Number of submitted and completed read jobs inconsistent (submitted: {}, completed {}).'.format(
                     read_jobs, done_read_jobs))
+
+        if write_jobs != done_write_jobs:
+            raise InternalError(
+                'Number of submitted and completed write jobs inconsistent (submitted: {}, completed {}).'.format(
+                    write_jobs, done_write_jobs))
 
         logger.info('Restore of version {} successful.'.format(version.uid.v_string))
 
@@ -729,7 +810,7 @@ class Benji(ReprMixIn):
                     # remove version
                     self._database_backend.rm_version(version.uid)
                     raise InputDataError('Source changed in regions outside of ones indicated by the hints.')
-            logger.info('Finished sanity check. Checked {} blocks {}.'.format(num_reading, check_block_ids))
+            logger.info('Finished sanity check. Checked {} blocks: {}.'.format(num_reading, check_block_ids))
 
         try:
             storage = StorageFactory.get_by_storage_id(version.storage_id)
@@ -793,13 +874,6 @@ class Benji(ReprMixIn):
                         checksum=None,
                         size=block.size,
                         valid=True)
-                # Don't try to detect sparse partial blocks as it counteracts the optimisation above
-                #elif data == b'\0' * block.size:
-                #    # if the block is only \0, set it as a sparse block.
-                #    stats['blocks_sparse'] += 1
-                #    stats['bytes_sparse'] += block.size
-                #    logger.debug('Skipping block (detected sparse) {}'.format(block.id))
-                #    self.database_backend.set_block(block.id, version_uid, None, None, block.size, valid=True)
                 elif existing_block:
                     self._database_backend.set_block(
                         id=block.id,
@@ -813,28 +887,28 @@ class Benji(ReprMixIn):
                 else:
                     block.uid = BlockUid(version.uid.integer, block.id + 1)
                     block.checksum = data_checksum
-                    storage.write(block, data)
+                    storage.write_block_async(block, data)
                     write_jobs += 1
                     logger.debug('Queued block {} for write (checksum {}...)'.format(block.id, data_checksum[:16]))
 
                 done_read_jobs += 1
 
                 try:
-                    for saved_block in storage.write_get_completed(timeout=0):
-                        if isinstance(saved_block, Exception):
-                            raise saved_block
+                    for written_block in storage.write_get_completed(timeout=0):
+                        if isinstance(written_block, Exception):
+                            raise written_block
 
-                        saved_block = cast(DereferencedBlock, saved_block)
+                        written_block = cast(DereferencedBlock, written_block)
 
                         self._database_backend.set_block(
-                            id=saved_block.id,
-                            version_uid=saved_block.version_uid,
-                            block_uid=saved_block.uid,
-                            checksum=saved_block.checksum,
-                            size=saved_block.size,
+                            id=written_block.id,
+                            version_uid=written_block.version_uid,
+                            block_uid=written_block.uid,
+                            checksum=written_block.checksum,
+                            size=written_block.size,
                             valid=True)
                         done_write_jobs += 1
-                        stats['bytes_written'] += saved_block.size
+                        stats['bytes_written'] += written_block.size
                 except (TimeoutError, CancelledError):
                     pass
 
@@ -846,21 +920,21 @@ class Benji(ReprMixIn):
                                                                           done_read_jobs / read_jobs * 100))
 
             try:
-                for saved_block in storage.write_get_completed():
-                    if isinstance(saved_block, Exception):
-                        raise saved_block
+                for written_block in storage.write_get_completed():
+                    if isinstance(written_block, Exception):
+                        raise written_block
 
-                    saved_block = cast(DereferencedBlock, saved_block)
+                    written_block = cast(DereferencedBlock, written_block)
 
                     self._database_backend.set_block(
-                        id=saved_block.id,
-                        version_uid=saved_block.version_uid,
-                        block_uid=saved_block.uid,
-                        checksum=saved_block.checksum,
-                        size=saved_block.size,
+                        id=written_block.id,
+                        version_uid=written_block.version_uid,
+                        block_uid=written_block.uid,
+                        checksum=written_block.checksum,
+                        size=written_block.size,
                         valid=True)
                     done_write_jobs += 1
-                    stats['bytes_written'] += saved_block.size
+                    stats['bytes_written'] += written_block.size
             except CancelledError:
                 pass
 
@@ -920,7 +994,17 @@ class Benji(ReprMixIn):
                     storage = StorageFactory.get_by_storage_id(storage_id)
                     logger.debug('Deleting UIDs from storage {}: {}'.format(storage.name,
                                                                             ', '.join([str(uid) for uid in uids])))
-                    no_del_uids = storage.rm_many(uids)
+
+                    for uid in uids:
+                        storage.rm_block_async(uid)
+
+                    no_del_uids = []
+                    for entry in storage.rm_get_completed():
+                        if isinstance(entry, BlockNotFoundError):
+                            no_del_uids.append(entry.uid)
+                        elif isinstance(uid, Exception):
+                            raise entry
+
                     if no_del_uids:
                         logger.info('Unable to delete these UIDs from storage {}: {}'.format(
                             storage.name, ', '.join([str(uid) for uid in no_del_uids])))
@@ -1219,7 +1303,7 @@ class BenjiStore(ReprMixIn):
                 # Block isn't cached already, fetch it
                 if self._block_cache.in_cache(block.uid):
                     storage = StorageFactory.get_by_storage_id(version.storage_id)
-                    data = storage.read_sync(block)
+                    data = storage.read_block(block)
                     self._block_cache.write(block.uid, data)
 
                 data_chunks.append(self._block_cache.read(block.uid, offset_in_block, length_in_block))
@@ -1259,7 +1343,7 @@ class BenjiStore(ReprMixIn):
                 # Read the block from the original
                 if block.uid:
                     storage = StorageFactory.get_by_storage_id(cow_version.storage_id)
-                    write_data = BytesIO(storage.read_sync(block))
+                    write_data = BytesIO(storage.read_block(block))
                 # Was a sparse block
                 else:
                     write_data = BytesIO(b'\0' * cow_version.block_size)
@@ -1300,7 +1384,7 @@ class BenjiStore(ReprMixIn):
                 block.checksum = None
                 block.uid = BlockUid(None, None)
             else:
-                storage.write_sync(block, data)
+                storage.write_block(block, data)
                 self._block_cache.rm(block.uid)
 
             try:
@@ -1314,7 +1398,7 @@ class BenjiStore(ReprMixIn):
             except:
                 # Prevent orphaned blocks
                 if block.uid:
-                    storage.rm(block.uid)
+                    storage.rm_block(block.uid)
 
         self._benji_obj._database_backend.commit()
         self._benji_obj._database_backend.set_version(cow_version.uid, status=VersionStatus.valid, protected=True)

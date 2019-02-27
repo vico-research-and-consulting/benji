@@ -656,7 +656,7 @@ def main():
     p = subparsers_root.add_parser('rm', help='Remove one or more versions')
     p.add_argument('-f', '--force', action='store_true', help='Force removal (overrides protection of recent versions)')
     p.add_argument('-k', '--keep-metadata-backup', action='store_true', help='Keep version metadata backup')
-    p.add_argument('--override-locks', action='store_true', help='Override and release any held locks (dangerous)')
+    p.add_argument('--override-lock', action='store_true', help='Override and release any held locks (dangerous)')
     p.add_argument('version_uids', metavar='version_uid', nargs='+', help='Version UID')
     p.set_defaults(func='rm')
 
@@ -671,7 +671,7 @@ def main():
 
     # CLEANUP
     p = subparsers_root.add_parser('cleanup', help='Cleanup no longer referenced blocks')
-    p.add_argument('--override-locks', action='store_true', help='Override and release any held locks (dangerous)')
+    p.add_argument('--override-lock', action='store_true', help='Override and release any held lock (dangerous)')
     p.set_defaults(func='cleanup')
 
     # PROTECT
@@ -828,6 +828,12 @@ def main():
         config = Config()
 
     init_logging(config.get('logFile', types=(str, type(None))), args.log_level, no_color=args.no_color)
+
+    if sys.hexversion < 0x030600F0:
+        raise benji.exception.InternalError('Benji only supports Python 3.6 or above.')
+
+    if sys.hexversion < 0x030604F0:
+        logger.warning('The installed Python version will use excessive amounts of memory when used with Benji. Upgrade Python to at least 3.6.4.')
 
     commands = Commands(args.machine_output, config)
     func = getattr(commands, args.func)

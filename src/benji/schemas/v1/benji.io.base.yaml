@@ -3,8 +3,13 @@ configuration:
   nullable: True
   required: True
   schema:
+    simultaneousWrites:
+      type: integer
+      empty: False
+      min: 1
+      default: 3
     simultaneousReads:
       type: integer
       empty: False
       min: 1
-      default: 1
+      default: 3

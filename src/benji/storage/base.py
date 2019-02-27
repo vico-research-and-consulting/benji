@@ -1,16 +1,13 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 import base64
-import concurrent
 import datetime
 import json
 import os
 import threading
 import time
 from abc import ABCMeta, abstractmethod
-from concurrent.futures import ThreadPoolExecutor, Future
-from threading import BoundedSemaphore
-from typing import Union, Optional, Dict, Tuple, List, Sequence, cast, AbstractSet, Iterator
+from typing import Union, Optional, Dict, Tuple, List, Sequence, cast, Iterator
 
 import semantic_version
 from diskcache import FanoutCache
@@ -19,11 +16,12 @@ from benji.config import Config, ConfigDict
 from benji.database import VersionUid, DereferencedBlock, BlockUid, Block
 from benji.exception import ConfigurationError, BenjiException
 from benji.factory import TransformFactory
+from benji.jobexecutor import JobExecutor
 from benji.logging import logger
 from benji.repr import ReprMixIn
 from benji.storage.dicthmac import DictHMAC
 from benji.transform.base import TransformBase
-from benji.utils import TokenBucket, future_results_as_completed, derive_key
+from benji.utils import TokenBucket, derive_key
 from benji.versions import VERSIONS
 
 
@@ -39,10 +37,19 @@ class InvalidBlockException(BenjiException, IOError):
         return self._block
 
 
-class StorageBase(ReprMixIn, metaclass=ABCMeta):
+class BlockNotFoundError(BenjiException, IOError):
 
-    READ_QUEUE_LENGTH = 1
-    WRITE_QUEUE_LENGTH = 1
+    def __init__(self, message: str, uid: BlockUid) -> None:
+        super().__init__(message)
+
+        self._uid = uid
+
+    @property
+    def uid(self) -> BlockUid:
+        return self._uid
+
+
+class StorageBase(ReprMixIn, metaclass=ABCMeta):
 
     _CHECKSUM_KEY = 'checksum'
     _CREATED_KEY = 'created'
@@ -70,6 +77,7 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
 
         simultaneous_writes = Config.get_from_dict(module_configuration, 'simultaneousWrites', types=int)
         simultaneous_reads = Config.get_from_dict(module_configuration, 'simultaneousReads', types=int)
+        simultaneous_removals = Config.get_from_dict(module_configuration, 'simultaneousRemovals', types=int)
         bandwidth_read = Config.get_from_dict(module_configuration, 'bandwidthRead', types=int)
         bandwidth_write = Config.get_from_dict(module_configuration, 'bandwidthWrite', types=int)
 
@@ -97,13 +105,9 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
         self.write_throttling = TokenBucket()
         self.write_throttling.set_rate(bandwidth_write)  # 0 disables throttling
 
-        self._read_executor = ThreadPoolExecutor(max_workers=simultaneous_reads, thread_name_prefix='Storage-Reader')
-        self._read_futures: List[Future] = []
-        self._read_semaphore = BoundedSemaphore(simultaneous_reads + self.READ_QUEUE_LENGTH)
-
-        self._write_executor = ThreadPoolExecutor(max_workers=simultaneous_writes, thread_name_prefix='Storage-Writer')
-        self._write_futures: List[Future] = []
-        self._write_semaphore = BoundedSemaphore(simultaneous_writes + self.WRITE_QUEUE_LENGTH)
+        self._read_executor = JobExecutor(name='Storage-Read', workers=simultaneous_reads, blocking_submit=False)
+        self._write_executor = JobExecutor(name='Storage-Write', workers=simultaneous_writes, blocking_submit=True)
+        self._remove_executor = JobExecutor(name='Storage-Remove', workers=simultaneous_removals, blocking_submit=True)
 
     @property
     def name(self) -> str:
@@ -209,29 +213,20 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
 
         return block
 
-    def write(self, block: Union[DereferencedBlock, Block], data: bytes) -> None:
-        self._write_semaphore.acquire()
-
+    def write_block_async(self, block: Union[DereferencedBlock, Block], data: bytes) -> None:
         block_deref = block.deref() if isinstance(block, Block) else block
 
-        def write_with_release():
-            try:
-                return self._write(block_deref, data)
-            except Exception:
-                raise
-            finally:
-                self._write_semaphore.release()
+        def job():
+            return self._write(block_deref, data)
 
-        self._write_futures.append(self._write_executor.submit(write_with_release))
+        self._write_executor.submit(job)
 
-    def write_sync(self, block: Union[DereferencedBlock, Block], data: bytes) -> None:
+    def write_block(self, block: Union[DereferencedBlock, Block], data: bytes) -> None:
         block_deref = block.deref() if isinstance(block, Block) else block
         self._write(block_deref, data)
 
     def write_get_completed(self, timeout: int = None) -> Iterator[Union[DereferencedBlock, BaseException]]:
-        """ Returns a generator for all completed read jobs
-        """
-        return future_results_as_completed(self._write_futures, timeout=timeout)
+        return self._write_executor.get_completed(timeout=timeout)
 
     def _read(self, block: DereferencedBlock, metadata_only: bool) -> Tuple[DereferencedBlock, Optional[bytes], Dict]:
         key = block.uid.storage_object_to_path()
@@ -271,22 +266,19 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
 
         return block, data, metadata
 
-    def read(self, block: Block, metadata_only: bool = False) -> None:
+    def read_block_async(self, block: Block, metadata_only: bool = False) -> None:
 
-        def read_with_acquire():
-            self._read_semaphore.acquire()
+        def job():
             return self._read(block.deref(), metadata_only)
 
-        self._read_futures.append(self._read_executor.submit(read_with_acquire))
+        self._read_executor.submit(job)
 
-    def read_sync(self, block: Block, metadata_only: bool = False) -> Optional[bytes]:
+    def read_block(self, block: Block, metadata_only: bool = False) -> Optional[bytes]:
         return self._read(block.deref(), metadata_only)[1]
 
     def read_get_completed(self,
                            timeout: int = None) -> Iterator[Union[Tuple[DereferencedBlock, bytes, Dict], BaseException]]:
-        """ Returns a generator for all completed read jobs
-        """
-        return future_results_as_completed(self._read_futures, semaphore=self._read_semaphore, timeout=timeout)
+        return self._read_executor.get_completed(timeout=timeout)
 
     def check_block_metadata(self, *, block: DereferencedBlock, data_length: Optional[int], metadata: Dict) -> None:
         # Existence of keys has already been checked in _decode_metadata() and _read()
@@ -308,24 +300,43 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
                     cast(str, block.checksum)[:16],  # We know that block.checksum is set
                     metadata[self._CHECKSUM_KEY][:16]))
 
-    def rm(self, uid: BlockUid) -> None:
+    def _rm_block(self, uid: BlockUid) -> BlockUid:
         key = uid.storage_object_to_path()
         metadata_key = key + self._META_SUFFIX
         try:
             self._rm_object(key)
+        except FileNotFoundError as exception:
+            raise BlockNotFoundError('Block UID {} not found on storage.'.format(str(uid)), uid) from exception
         finally:
             try:
                 self._rm_object(metadata_key)
             except FileNotFoundError:
                 pass
+        return uid
 
-    def rm_many(self, uids: Union[Sequence[BlockUid], AbstractSet[BlockUid]]) -> List[BlockUid]:
-        keys = [uid.storage_object_to_path() for uid in uids]
-        metadata_keys = [key + self._META_SUFFIX for key in keys]
+    def rm_block_async(self, uid: BlockUid) -> None:
 
-        errors = self._rm_many_objects(keys)
-        self._rm_many_objects(metadata_keys)
-        return [cast(BlockUid, BlockUid.storage_path_to_object(error)) for error in errors]
+        def job():
+            return self._rm_block(uid)
+
+        self._remove_executor.submit(job)
+
+    def rm_block(self, uid: BlockUid) -> None:
+        self._rm_block(uid)
+
+    def rm_get_completed(self, timeout: int = None) -> Iterator[Union[BlockUid, BaseException]]:
+        return self._remove_executor.get_completed(timeout=timeout)
+
+    def wait_rms_finished(self):
+        self._remove_executor.wait_for_all()
+
+    # def rm_many_blocks(self, uids: Union[Sequence[BlockUid], AbstractSet[BlockUid]]) -> List[BlockUid]:
+    #     keys = [uid.storage_object_to_path() for uid in uids]
+    #     metadata_keys = [key + self._META_SUFFIX for key in keys]
+    #
+    #     errors = self._rm_many_objects(keys)
+    #     self._rm_many_objects(metadata_keys)
+    #     return [cast(BlockUid, BlockUid.storage_path_to_object(error)) for error in errors]
 
     def list_blocks(self) -> List[BlockUid]:
         keys = self._list_objects(BlockUid.storage_prefix())
@@ -445,36 +456,16 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
                 raise IOError('Unknown transform {} in object metadata.'.format(name))
         return data
 
-    def wait_reads_finished(self) -> None:
-        concurrent.futures.wait(self._read_futures)
-
     def wait_writes_finished(self) -> None:
-        concurrent.futures.wait(self._write_futures)
+        self._write_executor.wait_for_all()
 
     def use_read_cache(self, enable: bool) -> bool:
         return False
 
     def close(self) -> None:
-        if len(self._read_futures) > 0:
-            logger.warning('Storage backend closed with {} outstanding read jobs, cancelling them.'.format(
-                len(self._read_futures)))
-            for future in self._read_futures:
-                future.cancel()
-            logger.debug('Storage backend cancelled all outstanding read jobs.')
-            # Get all jobs so that the semaphore gets released and still waiting jobs can complete
-            for result in self.read_get_completed():
-                pass
-            logger.debug('Storage backend read results from all outstanding read jobs.')
-        if len(self._write_futures) > 0:
-            logger.warning('Storage backend closed with {} outstanding write jobs, cancelling them.'.format(
-                len(self._write_futures)))
-            for future in self._write_futures:
-                future.cancel()
-            logger.debug('Storage backend cancelled all outstanding write jobs.')
-            # Write jobs release their semaphore at completion so we don't need to collect the results
-            self._write_futures = []
-        self._write_executor.shutdown()
         self._read_executor.shutdown()
+        self._write_executor.shutdown()
+        self._remove_executor.shutdown()
 
     @abstractmethod
     def _write_object(self, key: str, data: bytes):
@@ -490,10 +481,6 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
 
     @abstractmethod
     def _rm_object(self, key: str) -> None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def _rm_many_objects(self, keys: Sequence[str]) -> List[str]:
         raise NotImplementedError
 
     @abstractmethod

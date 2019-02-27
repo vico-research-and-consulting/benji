@@ -59,7 +59,7 @@ class SmokeTestCase(BenjiTestCaseBase):
         scrub_history = BlockUidHistory()
         deep_scrub_history = BlockUidHistory()
         storage_name = 's1'
-        for i in range(1, 100):
+        for i in range(1, 50):
             logger.debug('Run {}'.format(i + 1))
             hints = []
             if not os.path.exists(image_filename):
@@ -177,20 +177,29 @@ class SmokeTestCase(BenjiTestCaseBase):
             benji_obj.close()
             logger.debug('Deep scrub with history successful')
 
-            restore_filename_1 = os.path.join(testpath, 'restore.{}'.format(i + 1))
-            restore_filename_2 = os.path.join(testpath, 'restore-mdl.{}'.format(i + 1))
+            restore_filename = os.path.join(testpath, 'restore.{}'.format(i + 1))
+            restore_filename_mdl = os.path.join(testpath, 'restore-mdl.{}'.format(i + 1))
+            restore_filename_sparse = os.path.join(testpath, 'restore-sparse.{}'.format(i + 1))
             benji_obj = self.benjiOpen()
-            benji_obj.restore(version_uid, 'file://' + restore_filename_1, sparse=False, force=False)
+            benji_obj.restore(version_uid, 'file://' + restore_filename, sparse=False, force=False)
             benji_obj.close()
-            self.assertTrue(self.same(image_filename, restore_filename_1))
+            self.assertTrue(self.same(image_filename, restore_filename))
             logger.debug('Restore successful')
 
             benji_obj = self.benjiOpen(in_memory_database=True)
             benji_obj.metadata_restore([version_uid], storage_name)
-            benji_obj.restore(version_uid, 'file://' + restore_filename_2, sparse=False, force=False)
+            benji_obj.restore(version_uid, 'file://' + restore_filename_mdl, sparse=False, force=False)
             benji_obj.close()
-            self.assertTrue(self.same(image_filename, restore_filename_2))
+            self.assertTrue(self.same(image_filename, restore_filename_mdl))
             logger.debug('Metadata-backend-less restore successful')
+
+            benji_obj = self.benjiOpen(in_memory_database=True)
+            benji_obj.metadata_restore([version_uid], storage_name)
+            benji_obj.restore(version_uid, 'file://' + restore_filename_sparse, sparse=True, force=False)
+            benji_obj.close()
+            self.assertTrue(self.same(image_filename, restore_filename_sparse))
+            logger.debug('Sparse restore successful')
+
             base_version_uid = version_uid
 
             # delete old versions
@@ -238,7 +247,7 @@ class SmokeTestCaseSQLLite_File(SmokeTestCase, TestCase):
                 path: {testpath}/data
                 consistencyCheckWrites: True
                 simultaneousWrites: 5
-                simultaneousReads: 5                    
+                simultaneousReads: 5
                 activeTransforms:
                   - zstd
                   - k1
@@ -253,7 +262,7 @@ class SmokeTestCaseSQLLite_File(SmokeTestCase, TestCase):
                 path: {testpath}/data-2
                 consistencyCheckWrites: True
                 simultaneousWrites: 5
-                simultaneousReads: 5                    
+                simultaneousReads: 5
                 activeTransforms:
                   - zstd
                   - k1
@@ -298,8 +307,9 @@ class SmokeTestCasePostgreSQL_File(SmokeTestCase, TestCase):
               configuration:
                 path: {testpath}/data
                 consistencyCheckWrites: True
-                simultaneousWrites: 5
-                simultaneousReads: 5                    
+                simultaneousReads: 3
+                simultaneousWrites: 3
+                simultaneousRemovals: 3
                 activeTransforms:
                   - zstd
                   - k1
@@ -313,8 +323,9 @@ class SmokeTestCasePostgreSQL_File(SmokeTestCase, TestCase):
               configuration:
                 path: {testpath}/data-2
                 consistencyCheckWrites: True
-                simultaneousWrites: 5
-                simultaneousReads: 5                    
+                simultaneousReads: 3
+                simultaneousWrites: 3
+                simultaneousRemovals: 3
                 activeTransforms:
                   - zstd
                   - k1
@@ -363,10 +374,12 @@ class SmokeTestCasePostgreSQL_S3(SmokeTestCase, TestCase):
                 awsSecretAccessKey: minio123
                 endpointUrl: http://127.0.0.1:9901/
                 bucketName: benji
-                multiDelete: true
                 addressingStyle: path
                 disableEncodingType: false
-                consistencyCheckWrites: True                 
+                consistencyCheckWrites: True
+                simultaneousReads: 3
+                simultaneousWrites: 3
+                simultaneousRemovals: 3
                 activeTransforms:
                   - zstd
                   - k1
@@ -382,10 +395,12 @@ class SmokeTestCasePostgreSQL_S3(SmokeTestCase, TestCase):
                 awsSecretAccessKey: minio123
                 endpointUrl: http://127.0.0.1:9901/
                 bucketName: benji-2
-                multiDelete: true
                 addressingStyle: path
                 disableEncodingType: false
-                consistencyCheckWrites: True                 
+                consistencyCheckWrites: True
+                simultaneousReads: 3
+                simultaneousWrites: 3
+                simultaneousRemovals: 3
                 activeTransforms:
                   - zstd
                   - k1
@@ -434,10 +449,12 @@ class SmokeTestCasePostgreSQL_S3_ReadCache(SmokeTestCase, TestCase):
                 awsSecretAccessKey: minio123
                 endpointUrl: http://127.0.0.1:9901/
                 bucketName: benji
-                multiDelete: true
                 addressingStyle: path
                 disableEncodingType: false
-                consistencyCheckWrites: True                 
+                consistencyCheckWrites: True
+                simultaneousReads: 3
+                simultaneousWrites: 3
+                simultaneousRemovals: 3
                 activeTransforms:
                   - zstd
                   - k1
@@ -457,10 +474,12 @@ class SmokeTestCasePostgreSQL_S3_ReadCache(SmokeTestCase, TestCase):
                 awsSecretAccessKey: minio123
                 endpointUrl: http://127.0.0.1:9901/
                 bucketName: benji-2
-                multiDelete: true
                 addressingStyle: path
                 disableEncodingType: false
-                consistencyCheckWrites: True                 
+                consistencyCheckWrites: True
+                simultaneousReads: 3
+                simultaneousWrites: 3
+                simultaneousRemovals: 3
                 activeTransforms:
                   - zstd
                   - k1
@@ -535,7 +554,7 @@ class SmokeTestCasePostgreSQL_B2(SmokeTestCase):
                 writeObjectAttempts: 3
                 readObjectAttempts: 3
                 uploadAttempts: 5
-                consistencyCheckWrites: True              
+                consistencyCheckWrites: True
                 activeTransforms:
                   - zstd
                   - k1
