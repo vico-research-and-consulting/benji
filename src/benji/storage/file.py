@@ -2,7 +2,8 @@
 # -*- encoding: utf-8 -*-
 
 import os
-from typing import List
+from os.path import getsize
+from typing import Union, Iterable, Tuple
 
 from benji.config import Config, ConfigDict
 from benji.storage.base import StorageBase
@@ -21,20 +22,22 @@ class Storage(StorageBase):
 
         self.path = Config.get_from_dict(module_configuration, 'path', types=str)
 
-        # Ensure that self.path ends in a slash
-        if not self.path.endswith('/'):
-            self.path = self.path + '/'
+        # Ensure that self.path ends in os.path.sep
+        if not self.path.endswith(os.path.sep):
+            self.path = os.path.join(self.path, '')
 
     def _write_object(self, key: str, data: bytes) -> None:
         filename = os.path.join(self.path, key)
 
         try:
-            with open(filename, 'wb') as f:
+            with open(filename, 'wb', buffering=0) as f:
                 f.write(data)
+                os.fdatasync(f.fileno())
         except FileNotFoundError:
             os.makedirs(os.path.dirname(filename), exist_ok=True)
-            with open(filename, 'wb') as f:
+            with open(filename, 'wb', buffering=0) as f:
                 f.write(data)
+                os.fdatasync(f.fileno())
 
     def _read_object(self, key: str) -> bytes:
         filename = os.path.join(self.path, key)
@@ -71,10 +74,19 @@ class Storage(StorageBase):
     #             errors.append(key)
     #     return errors
 
-    def _list_objects(self, prefix: str) -> List[str]:
-        matches = []
-        for root, dirnames, filenames in os.walk(os.path.join(self.path, prefix)):
+    def _list_objects(self, prefix: str = None,
+                      include_size: bool = False) -> Union[Iterable[str], Iterable[Tuple[str, int]]]:
+        for root, dirnames, filenames in os.walk(os.path.join(self.path, prefix) if prefix is not None else self.path):
             for filename in filenames:
                 key = (os.path.join(root, filename))[len(self.path):]
-                matches.append(key)
-        return matches
+                if include_size:
+                    try:
+                        size = getsize(os.path.join(root, filename))
+                    except OSError:
+                        # The file might be gone (due to benji cleanup for example) when we get to the getsize().
+                        # Just move on to the next filename...
+                        continue
+                    else:
+                        yield key, size
+                else:
+                    yield key
