@@ -2,6 +2,7 @@ import datetime
 import time
 import timeit
 import uuid
+from typing import List, Dict, Any
 from unittest import TestCase
 
 import sqlalchemy
@@ -96,21 +97,24 @@ class DatabaseBackendTestCase(DatabaseBackendTestCaseBase):
             size=256 * 1024 * 4096,
             block_size=1024 * 4096,
             storage_id=1)
-        self.database_backend.commit()
 
         checksums = []
         uids = []
         num_blocks = 256
+        blocks: List[Dict[str, Any]] = []
         for id in range(num_blocks):
             checksums.append(self.random_hex(64))
             uids.append(BlockUid(1, id))
-            self.database_backend.set_block(
-                id=id,
-                version_uid=version.uid,
-                block_uid=uids[id],
-                checksum=checksums[id],
-                size=1024 * 4096,
-                valid=True)
+            blocks.append({
+                'id': id,
+                'version_uid': version.uid,
+                'uid_left': uids[id].left,
+                'uid_right': uids[id].right,
+                'checksum': checksums[id],
+                'size': 1024 * 4096,
+                'valid': True
+            })
+        self.database_backend.create_blocks(blocks=blocks)
         self.database_backend.commit()
 
         for id, checksum in enumerate(checksums):
@@ -131,9 +135,24 @@ class DatabaseBackendTestCase(DatabaseBackendTestCaseBase):
             self.assertEqual(1024 * 4096, block.size)
             self.assertTrue(block.valid)
 
-        blocks = self.database_backend.get_blocks_by_version(version.uid)
-        self.assertEqual(num_blocks, len(blocks))
-        for id, block in enumerate(blocks):
+        for id, uid in enumerate(uids):
+            block = self.database_backend.get_block_by_id(version.uid, id)
+            self.assertEqual(id, block.id)
+            self.assertEqual(version.uid, block.version_uid)
+            self.assertEqual(uid, block.uid)
+            self.assertEqual(checksums[id], block.checksum)
+            self.assertEqual(1024 * 4096, block.size)
+            self.assertTrue(block.valid)
+
+        blocks_iter = self.database_backend.get_blocks_by_version(version.uid)
+        blocks_count = self.database_backend.get_blocks_count_by_version(version.uid)
+        sparse_blocks_count = self.database_backend.get_blocks_count_by_version(version.uid, sparse_only=True)
+        self.assertEqual(num_blocks, len(list(blocks_iter)))
+        self.assertEqual(num_blocks, blocks_count)
+        self.assertEqual(0, sparse_blocks_count)
+
+        blocks_iter = self.database_backend.get_blocks_by_version(version.uid)
+        for id, block in enumerate(blocks_iter):
             self.assertEqual(id, block.id)
             self.assertEqual(version.uid, block.version_uid)
             self.assertEqual(uids[id], block.uid)
@@ -141,7 +160,8 @@ class DatabaseBackendTestCase(DatabaseBackendTestCaseBase):
             self.assertEqual(1024 * 4096, block.size)
             self.assertTrue(block.valid)
 
-        for id, block in enumerate(blocks):
+        blocks_iter = self.database_backend.get_blocks_by_version(version.uid)
+        for id, block in enumerate(blocks_iter):
             dereferenced_block = block.deref()
             self.assertEqual(id, dereferenced_block.id)
             self.assertEqual(version.uid, dereferenced_block.version_uid)
@@ -152,17 +172,18 @@ class DatabaseBackendTestCase(DatabaseBackendTestCaseBase):
             self.assertTrue(dereferenced_block.valid)
 
         self.database_backend.rm_version(version.uid)
-        self.database_backend.commit()
-        blocks = self.database_backend.get_blocks_by_version(version.uid)
-        self.assertEqual(0, len(blocks))
+        blocks_iter = self.database_backend.get_blocks_by_version(version.uid)
+        blocks_count = self.database_backend.get_blocks_count_by_version(version.uid)
+        self.assertEqual(0, len(list(blocks_iter)))
+        self.assertEqual(0, blocks_count)
 
-        count = 0
+        deleted_count = 0
         for uids_deleted in self.database_backend.get_delete_candidates(-1):
             for storage in uids_deleted.values():
                 for uid in storage:
                     self.assertIn(uid, uids)
-                    count += 1
-        self.assertEqual(num_blocks, count)
+                    deleted_count += 1
+        self.assertEqual(num_blocks, deleted_count)
 
     def test_lock_version(self):
         locking = self.database_backend.locking()
@@ -371,38 +392,6 @@ class DatabaseBackendTestCase(DatabaseBackendTestCaseBase):
         logger.debug('test_version_filter_issue_9_slowness: t1 {}, t2 {}'.format(t1, t2))
         self.assertLess(t1 - t2, 5)
 
-    def test_version_statistic_filter(self):
-        for i in range(16):
-            self.database_backend.set_stats(
-                uid=VersionUid(i),
-                base_uid=None,
-                hints_supplied=True,
-                date=datetime.datetime.utcnow(),
-                name='backup-name',
-                snapshot_name='snapshot-name.{}'.format(i),
-                size=16 * 1024 * 4096,
-                storage_id=1,
-                block_size=4 * 1024 * 4096,
-                bytes_read=1,
-                bytes_written=2,
-                bytes_dedup=3,
-                bytes_sparse=4,
-                duration=5)
-
-        stats = self.database_backend.get_stats_with_filter()
-        self.assertEqual(16, len(stats))
-
-        stats = self.database_backend.get_stats_with_filter('snapshot_name == "snapshot-name.1"')
-        self.assertEqual(1, len(stats))
-
-        self.assertRaises(UsageError,
-                          lambda: self.database_backend.get_stats_with_filter('labels["label-key"] and "label-value"'))
-        self.assertRaises(UsageError, lambda: self.database_backend.get_stats_with_filter('True'))
-        self.assertRaises(UsageError, lambda: self.database_backend.get_stats_with_filter('10'))
-        self.assertRaises(UsageError, lambda: self.database_backend.get_stats_with_filter('"hallo" == "hey"'))
-        self.assertRaises(UsageError,
-                          lambda: self.database_backend.get_stats_with_filter('labels["label-key"] == "label-value"'))
-
     def test_version_filter_dateparse(self):
         version_uids = set()
         for i in range(3):
@@ -445,11 +434,6 @@ class DatabaseBackendTestCase(DatabaseBackendTestCaseBase):
         versions = self.database_backend.get_versions_with_filter('date <= "{}"'.format(
             datetime.datetime.now(tz=tz.tzlocal()).strftime("%Y-%m-%dT%H:%M:%S")))
         self.assertEqual(3, len(versions))
-
-        self.assertRaises(sqlalchemy.exc.StatementError,
-                          lambda: self.database_backend.get_stats_with_filter('date == "asdasdsa asdasd asdasd"'))
-        self.assertRaises(sqlalchemy.exc.StatementError,
-                          lambda: self.database_backend.get_stats_with_filter('date == 10'))
 
 
 class DatabaseBackendTestSQLLite(DatabaseBackendTestCase, TestCase):

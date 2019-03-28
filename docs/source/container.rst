@@ -1,7 +1,7 @@
 .. include:: global.rst.inc
 .. _container:
 
-Containerised Benji
+Containerized Benji
 ===================
 
 Images
@@ -64,7 +64,7 @@ to be executed once in a while to actually remove blocks that are no longer used
 At the end of each command related `Prometheus <https://prometheus.io/>`_ metrics are pushed to the configured
 `pushgateway <https://github.com/prometheus/pushgateway>`_. If ``PROM_PUSH_GATEWAY`` is not set, this step is skipped.
 
-The backup script uses Ceph's and Benji's differential backup features if possible. Normally only the initial backu
+The backup script uses Ceph's and Benji's differential backup features if possible. Normally only the initial backup
 is a full backup. RBD snapshots names are generated with a prefix of ``b-``.
 
 Helm Charts

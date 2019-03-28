@@ -10,8 +10,8 @@ from unittest import TestCase
 
 from benji.blockuidhistory import BlockUidHistory
 from benji.logging import logger
-from benji.scripts.benji import hints_from_rbd_diff
 from benji.tests.testcase import BenjiTestCaseBase
+from benji.utils import hints_from_rbd_diff
 
 kB = 1024
 MB = kB * 1024
@@ -134,7 +134,7 @@ class SmokeTestCase(BenjiTestCaseBase):
             logger.debug('Restore of version successful')
 
             benji_obj = self.benjiOpen()
-            blocks = benji_obj._database_backend.get_blocks_by_version(version_uid)
+            blocks = list(benji_obj._database_backend.get_blocks_by_version(version_uid))
             self.assertEqual(list(range(len(blocks))), sorted([block.id for block in blocks]))
             self.assertTrue(len(blocks) > 0)
             if len(blocks) > 1:
