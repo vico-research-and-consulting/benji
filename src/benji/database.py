@@ -12,7 +12,6 @@ import sqlite3
 import time
 import uuid
 from abc import abstractmethod
-from binascii import hexlify, unhexlify
 from contextlib import contextmanager
 from functools import total_ordering
 from typing import Union, List, Tuple, TextIO, Dict, cast, Iterator, Set, Any, Optional, Sequence, Callable
@@ -27,6 +26,7 @@ from alembic import command as alembic_command
 from alembic.config import Config as alembic_config_Config
 from alembic.runtime.environment import EnvironmentContext
 from alembic.script import ScriptDirectory
+from binascii import hexlify, unhexlify
 
 from benji.config import Config
 from benji.exception import InputDataError, InternalError, AlreadyLocked, UsageError
@@ -49,16 +49,15 @@ class BenjiDateTime(sqlalchemy.types.TypeDecorator):
                 return value.astimezone(tz=datetime.timezone.utc).replace(tzinfo=None)
         elif isinstance(value, str):
             import dateparser
-            date = dateparser.parse(
-                date_string=value,
-                date_formats=['%Y-%m-%dT%H:%M:%S'],
-                locales=['en'],
-                settings={
-                    'PREFER_DATES_FROM': 'past',
-                    'PREFER_DAY_OF_MONTH': 'first',
-                    'RETURN_AS_TIMEZONE_AWARE': True,
-                    'TO_TIMEZONE': 'UTC'
-                })
+            date = dateparser.parse(date_string=value,
+                                    date_formats=['%Y-%m-%dT%H:%M:%S'],
+                                    locales=['en'],
+                                    settings={
+                                        'PREFER_DATES_FROM': 'past',
+                                        'PREFER_DAY_OF_MONTH': 'first',
+                                        'RETURN_AS_TIMEZONE_AWARE': True,
+                                        'TO_TIMEZONE': 'UTC'
+                                    })
             if date is None:
                 raise ValueError('Invalid date and time specification: {}.'.format(value))
             return date.replace(tzinfo=None)
@@ -333,11 +332,11 @@ class Version(Base):
     size = sqlalchemy.Column(sqlalchemy.BigInteger, nullable=False)
     block_size = sqlalchemy.Column(sqlalchemy.Integer, nullable=False)
     storage_id = sqlalchemy.Column(sqlalchemy.Integer, nullable=False)
-    status = sqlalchemy.Column(
-        VersionStatusType,
-        sqlalchemy.CheckConstraint(
-            'status >= {} AND status <= {}'.format(VersionStatus.min.value, VersionStatus.max.value), name='status'),
-        nullable=False)
+    status = sqlalchemy.Column(VersionStatusType,
+                               sqlalchemy.CheckConstraint('status >= {} AND status <= {}'.format(
+                                   VersionStatus.min.value, VersionStatus.max.value),
+                                                          name='status'),
+                               nullable=False)
     protected = sqlalchemy.Column(sqlalchemy.Boolean(name='protected'), nullable=False)
 
     # Statistics
@@ -382,8 +381,10 @@ class Label(Base):
 
     REPR_SQL_ATTR_SORT_FIRST = ['version_uid', 'name', 'value']
 
-    version_uid = sqlalchemy.Column(
-        VersionUidType, sqlalchemy.ForeignKey('versions.uid', ondelete='CASCADE'), primary_key=True, nullable=False)
+    version_uid = sqlalchemy.Column(VersionUidType,
+                                    sqlalchemy.ForeignKey('versions.uid', ondelete='CASCADE'),
+                                    primary_key=True,
+                                    nullable=False)
     name = sqlalchemy.Column(sqlalchemy.String(255), nullable=False, primary_key=True)
     value = sqlalchemy.Column(sqlalchemy.String(255), nullable=False, index=True)
 
@@ -437,8 +438,9 @@ class Block(Base):
     uid_right = sqlalchemy.Column(sqlalchemy.Integer, nullable=True)  # 4 bytes
     uid_left = sqlalchemy.Column(sqlalchemy.Integer, nullable=True)  # 4 bytes
     size = sqlalchemy.Column(sqlalchemy.Integer, nullable=True)  # 4 bytes
-    version_uid = sqlalchemy.Column(
-        VersionUidType, sqlalchemy.ForeignKey('versions.uid', ondelete='CASCADE'), nullable=False)  # 4 bytes
+    version_uid = sqlalchemy.Column(VersionUidType,
+                                    sqlalchemy.ForeignKey('versions.uid', ondelete='CASCADE'),
+                                    nullable=False)  # 4 bytes
     valid = sqlalchemy.Column(sqlalchemy.Boolean(name='valid'), nullable=False)  # 1 byte
     checksum = sqlalchemy.Column(ChecksumType(MAXIMUM_CHECKSUM_LENGTH), nullable=True)  # 2 to 33 bytes
 
@@ -473,11 +475,10 @@ class DeletedBlock(Base):
     date = sqlalchemy.Column("date", BenjiDateTime, nullable=False)
     # BigInteger as the id could get large over time
     # Use INTEGER with SQLLite to get AUTOINCREMENT and the INTEGER type of SQLLite can store huge values anyway.
-    id = sqlalchemy.Column(
-        sqlalchemy.BigInteger().with_variant(sqlalchemy.Integer, "sqlite"),
-        primary_key=True,
-        autoincrement=True,
-        nullable=False)
+    id = sqlalchemy.Column(sqlalchemy.BigInteger().with_variant(sqlalchemy.Integer, "sqlite"),
+                           primary_key=True,
+                           autoincrement=True,
+                           nullable=False)
     storage_id = sqlalchemy.Column(sqlalchemy.Integer, nullable=False)
     uid_left = sqlalchemy.Column(sqlalchemy.Integer, nullable=False)
     uid_right = sqlalchemy.Column(sqlalchemy.Integer, nullable=False)
@@ -594,8 +595,7 @@ class DatabaseBackend(ReprMixIn):
             if self._engine.has_table('alembic_version'):
                 with self._engine.begin() as connection:
                     connection.execute(
-                        sqlalchemy.sql.ddl.DropTable(  # type: ignore
-                            sqlalchemy.Table('alembic_version', sqlalchemy.MetaData())))
+                        sqlalchemy.sql.ddl.DropTable(sqlalchemy.Table('alembic_version', sqlalchemy.MetaData())))
 
         table_names = self._database_tables()
         if not table_names:
@@ -693,8 +693,8 @@ class DatabaseBackend(ReprMixIn):
             query = query.filter_by(snapshot_name=version_snapshot_name)
         if version_labels:
             for version_label in version_labels:
-                label_query = self._session.query(
-                    Label.version_uid).filter((Label.name == version_label[0]) & (Label.value == version_label[1]))
+                label_query = self._session.query(Label.version_uid).filter((Label.name == version_label[0]) &
+                                                                            (Label.value == version_label[1]))
                 query = query.filter(Version.uid.in_(label_query))
 
         return query.order_by(Version.name, Version.date).all()
@@ -789,8 +789,8 @@ class DatabaseBackend(ReprMixIn):
         return self._session.query(Block).filter_by(version_uid=version_uid, id=block_id).first()
 
     def get_block_by_checksum(self, checksum, storage_id):
-        return self._session.query(Block).filter_by(
-            checksum=checksum, valid=True).join(Version).filter_by(storage_id=storage_id).first()
+        return self._session.query(Block).filter_by(checksum=checksum,
+                                                    valid=True).join(Version).filter_by(storage_id=storage_id).first()
 
     # Our own version of yield_per without using a cursor
     # See: https://github.com/sqlalchemy/sqlalchemy/wiki/WindowedRangeQuery
@@ -884,8 +884,7 @@ class DatabaseBackend(ReprMixIn):
 
             if hit_list:
                 for uids in hit_list.values():
-                    self._session.query(DeletedBlock).filter(
-                        DeletedBlock.uid.in_(uids)).delete(synchronize_session=False)
+                    self._session.query(DeletedBlock).filter(DeletedBlock.uid.in_(uids)).delete(synchronize_session=False)
                 yield hit_list
                 # We expect that the caller has handled all the blocks returned so far, so we can call commit after
                 # the yield to keep the transaction small.
@@ -1083,8 +1082,7 @@ class DatabaseBackend(ReprMixIn):
             except KeyError:
                 pass  # does not exist
             else:
-                raise FileExistsError('Version {} already exists and so cannot be imported.'.format(
-                    version_uid.v_string))
+                raise FileExistsError('Version {} already exists and so cannot be imported.'.format(version_uid.v_string))
 
             version = Version(
                 uid=version_uid,
@@ -1144,8 +1142,8 @@ class DatabaseBackendLocking:
 
     def lock(self, *, lock_name: str, reason: str = None, locked_msg: str = None, override_lock: bool = False):
         try:
-            lock = self._session.query(Lock).filter_by(
-                host=self._host, lock_name=lock_name, process_id=self._uuid).first()
+            lock = self._session.query(Lock).filter_by(host=self._host, lock_name=lock_name,
+                                                       process_id=self._uuid).first()
             if lock is not None:
                 raise InternalError('Attempt to acquire lock {} twice.'.format(lock_name))
             lock = Lock(
@@ -1182,8 +1180,8 @@ class DatabaseBackendLocking:
 
     def update_lock(self, *, lock_name: str, reason: str = None) -> None:
         try:
-            lock = self._session.query(Lock).filter_by(
-                host=self._host, lock_name=lock_name, process_id=self._uuid).with_for_update().first()
+            lock = self._session.query(Lock).filter_by(host=self._host, lock_name=lock_name,
+                                                       process_id=self._uuid).with_for_update().first()
             if not lock:
                 raise InternalError('Lock {} isn\'t held by this instance or doesn\'t exist.'.format(lock_name))
             lock.reason = reason
@@ -1194,8 +1192,8 @@ class DatabaseBackendLocking:
 
     def unlock(self, *, lock_name: str) -> None:
         try:
-            lock = self._session.query(Lock).filter_by(
-                host=self._host, lock_name=lock_name, process_id=self._uuid).first()
+            lock = self._session.query(Lock).filter_by(host=self._host, lock_name=lock_name,
+                                                       process_id=self._uuid).first()
             if not lock:
                 raise InternalError('Lock {} isn\'t held by this instance or doesn\'t exist.'.format(lock_name))
             self._session.delete(lock)
@@ -1215,11 +1213,10 @@ class DatabaseBackendLocking:
             pass
 
     def lock_version(self, version_uid: VersionUid, reason: str = None, override_lock: bool = False) -> None:
-        self.lock(
-            lock_name=version_uid.v_string,
-            reason=reason,
-            locked_msg='Version {} is already locked.'.format(version_uid.v_string),
-            override_lock=override_lock)
+        self.lock(lock_name=version_uid.v_string,
+                  reason=reason,
+                  locked_msg='Version {} is already locked.'.format(version_uid.v_string),
+                  override_lock=override_lock)
 
     def is_version_locked(self, version_uid: VersionUid) -> bool:
         return self.is_locked(lock_name=version_uid.v_string)
@@ -1299,11 +1296,10 @@ class _QueryBuilder:
                 else:
                     return op(getattr(Version, self.name), other)
 
-            # See https://github.com/python/mypy/issues/2783 for the reason of type: ignore
-            def __eq__(self, other: Any) -> sqlalchemy.sql.elements.BinaryExpression:  # type: ignore
+            def __eq__(self, other: Any) -> sqlalchemy.sql.elements.BinaryExpression:
                 return self.op(operator.eq, other)
 
-            def __ne__(self, other: Any) -> sqlalchemy.sql.elements.BinaryExpression:  # type: ignore
+            def __ne__(self, other: Any) -> sqlalchemy.sql.elements.BinaryExpression:
                 return self.op(operator.ne, other)
 
             def __lt__(self, other: Any) -> sqlalchemy.sql.elements.BinaryExpression:
@@ -1330,15 +1326,14 @@ class _QueryBuilder:
             def op(self, op, other: Any) -> sqlalchemy.sql.elements.BinaryExpression:
                 if isinstance(other, Token):
                     raise TypeError('Comparing labels to labels or labels to identifiers is not supported.')
-                label_query = session.query(
-                    Label.version_uid).filter((Label.name == self.name) & op(Label.value, str(other)))
+                label_query = session.query(Label.version_uid).filter((Label.name == self.name) &
+                                                                      op(Label.value, str(other)))
                 return Version.uid.in_(label_query)
 
-            # See https://github.com/python/mypy/issues/2783 for the reason of type: ignore
-            def __eq__(self, other: Any) -> sqlalchemy.sql.elements.BinaryExpression:  # type: ignore
+            def __eq__(self, other: Any) -> sqlalchemy.sql.elements.BinaryExpression:
                 return self.op(operator.eq, other)
 
-            def __ne__(self, other: Any) -> sqlalchemy.sql.elements.BinaryExpression:  # type: ignore
+            def __ne__(self, other: Any) -> sqlalchemy.sql.elements.BinaryExpression:
                 return self.op(operator.ne, other)
 
             # This is called when the token is not part of a comparison and test for label existence

@@ -3,15 +3,15 @@
 import re
 import threading
 import time
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Union, Iterator
 
 import rados
 import rbd
-
 from benji.config import ConfigDict, Config
-from benji.database import DereferencedBlock
+from benji.database import DereferencedBlock, Block
 from benji.exception import UsageError, ConfigurationError
 from benji.io.base import IOBase
+from benji.jobexecutor import JobExecutor
 from benji.logging import logger
 
 
@@ -21,10 +21,17 @@ class IO(IOBase):
     _image_name: Optional[str]
     _snapshot_name: Optional[str]
 
-    def __init__(self, *, config: Config, name: str, module_configuration: ConfigDict, path: str,
+    def __init__(self, *, config: Config, name: str, module_configuration: ConfigDict, url: str,
                  block_size: int) -> None:
-        super().__init__(
-            config=config, name=name, module_configuration=module_configuration, path=path, block_size=block_size)
+        super().__init__(config=config,
+                         name=name,
+                         module_configuration=module_configuration,
+                         url=url,
+                         block_size=block_size)
+
+        if self.parsed_url.username or self.parsed_url.password or self.parsed_url.hostname or self.parsed_url.port \
+                    or self.parsed_url.params or self.parsed_url.fragment or self.parsed_url.query:
+            raise UsageError('The supplied URL {} is invalid.'.format(self.url))
 
         ceph_config_file = config.get_from_dict(module_configuration, 'cephConfigFile', types=str)
         client_identifier = config.get_from_dict(module_configuration, 'clientIdentifier', types=str)
@@ -42,14 +49,18 @@ class IO(IOBase):
         self._image_name = None
         self._snapshot_name = None
 
-    def open_r(self) -> None:
-        super().open_r()
+        self._simultaneous_reads = config.get_from_dict(module_configuration, 'simultaneousReads', types=int)
+        self._simultaneous_writes = config.get_from_dict(module_configuration, 'simultaneousWrites', types=int)
+        self._read_executor: Optional[JobExecutor] = None
+        self._write_executor: Optional[JobExecutor] = None
 
-        re_match = re.match('^([^/]+)/([^@]+)@?(.+)?$', self._path)
+    def open_r(self) -> None:
+        self._read_executor = JobExecutor(name='IO-Read', workers=self._simultaneous_reads, blocking_submit=False)
+
+        re_match = re.match('^([^/]+)/([^@]+)(?:@(.+))?$', self.parsed_url.path)
         if not re_match:
-            raise UsageError(
-                'URL {} is invalid . Need {}://<pool>/<imagename> or {}://<pool>/<imagename>@<snapshotname>.'.format(
-                    self.url, self.name, self.name))
+            raise UsageError('URL {} is invalid . Need {}:<pool>/<imagename> or {}:<pool>/<imagename>@<snapshotname>.'.format(
+                self.url, self.name, self.name))
         self._pool_name, self._image_name, self._snapshot_name = re_match.groups()
 
         # try opening it and quit if that's not possible.
@@ -64,11 +75,11 @@ class IO(IOBase):
             raise FileNotFoundError('RBD image or snapshot {} not found.'.format(self.url)) from None
 
     def open_w(self, size: int, force: bool = False, sparse: bool = False) -> None:
-        super().open_w(size, force, sparse)
+        self._write_executor = JobExecutor(name='IO-Write', workers=self._simultaneous_writes, blocking_submit=True)
 
-        re_match = re.match('^([^/]+)/([^@]+)$', self._path)
+        re_match = re.match('^([^/]+)/([^@]+)$', self.parsed_url.path)
         if not re_match:
-            raise UsageError('URL {} is invalid . Need {}://<pool>/<imagename>.'.format(self.url, self.name))
+            raise UsageError('URL {} is invalid . Need {}:<pool>/<imagename>.'.format(self.url, self.name))
         self._pool_name, self._image_name = re_match.groups()
 
         # try opening it and quit if that's not possible.
@@ -108,6 +119,12 @@ class IO(IOBase):
             finally:
                 image.close()
 
+    def close(self) -> None:
+        if self._read_executor:
+            self._read_executor.shutdown()
+        if self._write_executor:
+            self._write_executor.shutdown()
+
     def size(self) -> int:
         assert self._pool_name is not None and self._image_name is not None
         ioctx = self._cluster.open_ioctx(self._pool_name)
@@ -116,7 +133,7 @@ class IO(IOBase):
         return size
 
     def _read(self, block: DereferencedBlock) -> Tuple[DereferencedBlock, bytes]:
-        offset = block.id * self._block_size
+        offset = block.id * self.block_size
         t1 = time.time()
         ioctx = self._cluster.open_ioctx(self._pool_name)
         with rbd.Image(ioctx, self._image_name, self._snapshot_name, read_only=True) as image:
@@ -126,7 +143,7 @@ class IO(IOBase):
         if not data:
             raise EOFError('End of file reached on {} when there should be data.'.format(self.url))
 
-        logger.debug('{} read block {} in {:.2f}s'.format(
+        logger.debug('{} read block {} in {:.3f}s'.format(
             threading.current_thread().name,
             block.id,
             t2 - t1,
@@ -134,15 +151,33 @@ class IO(IOBase):
 
         return block, data
 
+    def read(self, block: Union[DereferencedBlock, Block]) -> None:
+        block_deref = block.deref() if isinstance(block, Block) else block
+
+        def job():
+            return self._read(block_deref)
+
+        assert self._read_executor is not None
+        self._read_executor.submit(job)
+
+    def read_sync(self, block: Union[DereferencedBlock, Block]) -> bytes:
+        block_deref = block.deref() if isinstance(block, Block) else block
+        return self._read(block_deref)[1]
+
+    def read_get_completed(self, timeout: Optional[int] = None
+                          ) -> Iterator[Union[Tuple[DereferencedBlock, bytes], BaseException]]:
+        assert self._read_executor is not None
+        return self._read_executor.get_completed(timeout=timeout)
+
     def _write(self, block: DereferencedBlock, data: bytes) -> DereferencedBlock:
-        offset = block.id * self._block_size
+        offset = block.id * self.block_size
         t1 = time.time()
         ioctx = self._cluster.open_ioctx(self._pool_name)
         with rbd.Image(ioctx, self._image_name, self._snapshot_name) as image:
             written = image.write(data, offset, rados.LIBRADOS_OP_FLAG_FADVISE_DONTNEED)
         t2 = time.time()
 
-        logger.debug('{} wrote block {} in {:.2f}s'.format(
+        logger.debug('{} wrote block {} in {:.3f}s'.format(
             threading.current_thread().name,
             block.id,
             t2 - t1,
@@ -151,5 +186,17 @@ class IO(IOBase):
         assert written == len(data)
         return block
 
-    def close(self) -> None:
-        super().close()
+    def write(self, block: DereferencedBlock, data: bytes) -> None:
+
+        def job():
+            return self._write(block, data)
+
+        assert self._write_executor is not None
+        self._write_executor.submit(job)
+
+    def write_sync(self, block: DereferencedBlock, data: bytes) -> None:
+        self._write(block, data)
+
+    def write_get_completed(self, timeout: Optional[int] = None) -> Iterator[Union[DereferencedBlock, BaseException]]:
+        assert self._write_executor is not None
+        return self._write_executor.get_completed(timeout=timeout)

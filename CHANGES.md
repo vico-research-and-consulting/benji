@@ -1,3 +1,55 @@
+## 0.6.0 (Kubecon Barcelona Edition), 22.05.2019
+
+Notable changes:
+
+* URL parsing of I/O resources is now conforming to standards. Especially for the RBD I/O module the two slashes
+  directly after the colon are no longer valid and have to be removed (`rbd://pool/image` -> `rbd:pool/image`).
+
+* Added I/O module for iSCSI. It is based on `libiscsi` and requires no elevated permissions. Please see the 
+  documentation as Benji requires a special version of the `libiscsi` Python bindings. The module is single-threaded
+  and synchronous, so performance will be limited. Contributions are welcome!
+  
+* The algorithm used by `benji enforce` has seen an overhaul and should be more comprehensible as the time categories
+  are based on natural time boundaries (start of the hour, day, week, month, and year) now.
+  
+* Added a restore helper script (`images/benji-k8s/scripts/benji-restore-pvc`) for Kubernetes. This script is intended
+  to be run on a management system with access to the Kubernetes cluster and can restore a version into a new or
+  an existing PVC/PV pair.
+  
+* The container images are now based on the Python 3.6 included in EPEL. The RBD support has been updated to Ceph
+  Nautilus. Nautilus also added RADOS and RBD Python bindings for Python 3.6 which are now used instead of building
+  them themselves.
+
+## v0.5.0, 02.04.2019
+
+Notable changes:
+
+* Added `fsfreeze` support to the `benji-k8s` Docker image. Just add the `benji-backup.me/fsfreeze: yes` annotation to
+  the PVC. Kubernetes hosts are accessed via pods which are deployed by a DaemonSet, see the Helm chart for details.
+
+* Use bulk inserts to speed up backups of images based on a previous version. This also decreases memory usage.
+  
+* Switched from in-memory block lists to an iterator based approach. This will increase performance and decrease
+  memory usage when backing up large images.
+   
+* Fixed a wrong index on the `blocks` table. This should also increase performance. The database will need to be
+  migrated with `benji database-migrate`.
+
+* Laid the foundation for structured logging.
+
+* Removed database table `stats` and assorted code and commands. Statistics are now kept together with the other
+  version metadata in the `versions` table. This means they are also removed when the version is removed. If
+  you want to keep historic statistics you need to export them beforehand with `benji -m ls` or 
+  `benji metadata-export`. This is a breaking change and you might need to adjust your scripts. As statistics
+  are now included in a version's metadata the metadata version has changed to `1.1.0`. Old metadata backups
+  and exports with a metadata version of `1.0.0` can be imported by the current  version. The statistics will
+  be empty in that case. The database will need to be migrated with `benji database-migrate`.
+ 
+* Fixed a bug in the time calculation of `benji enforce` which could lead to a late expiration of versions,
+  the timing was a few hours off.
+
+I'd like to thank @olifre and @adambmedent for their testing efforts!
+
 ## v0.4.0, 20.03.2019
 
 Notable changes:

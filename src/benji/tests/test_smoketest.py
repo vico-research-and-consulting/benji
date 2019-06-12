@@ -59,7 +59,7 @@ class SmokeTestCase(BenjiTestCaseBase):
         scrub_history = BlockUidHistory()
         deep_scrub_history = BlockUidHistory()
         storage_name = 's1'
-        for i in range(1, 50):
+        for i in range(1, 40):
             logger.debug('Run {}'.format(i + 1))
             hints = []
             if not os.path.exists(image_filename):
@@ -107,7 +107,7 @@ class SmokeTestCase(BenjiTestCaseBase):
                 version = benji_obj.backup(
                     version_name='data-backup',
                     version_snapshot_name='snapshot-name',
-                    source='file://' + image_filename,
+                    source='file:' + image_filename,
                     hints=hints_from_rbd_diff(hints.read()) if base_version_uid else None,
                     base_version_uid=base_version_uid,
                     storage_name=storage_name)
@@ -163,7 +163,7 @@ class SmokeTestCase(BenjiTestCaseBase):
             logger.debug('Deep scrub successful')
 
             benji_obj = self.benjiOpen()
-            benji_obj.deep_scrub(version_uid, 'file://' + image_filename)
+            benji_obj.deep_scrub(version_uid, 'file:' + image_filename)
             benji_obj.close()
             logger.debug('Deep scrub with source successful')
 
@@ -177,25 +177,35 @@ class SmokeTestCase(BenjiTestCaseBase):
             benji_obj.close()
             logger.debug('Deep scrub with history successful')
 
+            benji_obj = self.benjiOpen()
+            benji_obj.batch_scrub('uid == {}'.format(version_uid.integer), 100, 100)
+            benji_obj.close()
+            logger.debug('Batch scrub with history successful')
+
+            benji_obj = self.benjiOpen()
+            benji_obj.batch_deep_scrub('uid == {}'.format(version_uid.integer), 100, 100)
+            benji_obj.close()
+            logger.debug('Batch deep scrub with history successful')
+
             restore_filename = os.path.join(testpath, 'restore.{}'.format(i + 1))
             restore_filename_mdl = os.path.join(testpath, 'restore-mdl.{}'.format(i + 1))
             restore_filename_sparse = os.path.join(testpath, 'restore-sparse.{}'.format(i + 1))
             benji_obj = self.benjiOpen()
-            benji_obj.restore(version_uid, 'file://' + restore_filename, sparse=False, force=False)
+            benji_obj.restore(version_uid, 'file:' + restore_filename, sparse=False, force=False)
             benji_obj.close()
             self.assertTrue(self.same(image_filename, restore_filename))
             logger.debug('Restore successful')
 
             benji_obj = self.benjiOpen(in_memory_database=True)
             benji_obj.metadata_restore([version_uid], storage_name)
-            benji_obj.restore(version_uid, 'file://' + restore_filename_mdl, sparse=False, force=False)
+            benji_obj.restore(version_uid, 'file:' + restore_filename_mdl, sparse=False, force=False)
             benji_obj.close()
             self.assertTrue(self.same(image_filename, restore_filename_mdl))
             logger.debug('Metadata-backend-less restore successful')
 
             benji_obj = self.benjiOpen(in_memory_database=True)
             benji_obj.metadata_restore([version_uid], storage_name)
-            benji_obj.restore(version_uid, 'file://' + restore_filename_sparse, sparse=True, force=False)
+            benji_obj.restore(version_uid, 'file:' + restore_filename_sparse, sparse=True, force=False)
             benji_obj.close()
             self.assertTrue(self.same(image_filename, restore_filename_sparse))
             logger.debug('Sparse restore successful')
@@ -224,7 +234,7 @@ class SmokeTestCase(BenjiTestCaseBase):
             if (i % 13) == 0:
                 scrub_history = BlockUidHistory()
                 deep_scrub_history = BlockUidHistory()
-            if (i % 23) == 0:
+            if (i % 7) == 0:
                 base_version_uid = None
                 if storage_name == 's1':
                     storage_name = 's2'

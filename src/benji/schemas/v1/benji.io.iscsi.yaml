@@ -1,0 +1,46 @@
+configuration:
+  type: dict
+  required: False
+  empty: True
+  schema:
+    username:
+      type: string
+      empty: False
+      dependencies:
+        - password
+    password:
+      type: string
+      empty: False
+      dependencies:
+        - username
+    targetUsername:
+      type: string
+      empty: False
+      dependencies:
+        - targetPassword
+        # Target/bidirectional CHAP is only supported if you also have normal CHAP authentication.
+        - username
+    targetPassword:
+      type: string
+      empty: False
+      dependencies:
+        - targetUsername
+        # Target/bidirectional CHAP is only supported if you also have normal CHAP authentication.
+        - username
+    headerDigest:
+      type: string
+      empty: False
+      allowed:
+        - NONE
+        - NONE_CRC32C
+        - CRC32C_NONE
+        - CRC32C
+      default: NONE_CRC32C
+    initiatorName:
+      type: string
+      empty: False
+      default: iqn.2019-04.me.benji-backup:benji
+    timeout:
+      type: integer
+      empty: False
+      default: 0

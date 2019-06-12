@@ -10,8 +10,6 @@ from abc import ABCMeta, abstractmethod
 from typing import Union, Optional, Dict, Tuple, List, Sequence, cast, Iterator, Iterable
 
 import semantic_version
-from diskcache import FanoutCache
-
 from benji.config import Config, ConfigDict
 from benji.database import VersionUid, DereferencedBlock, BlockUid, Block
 from benji.exception import ConfigurationError, BenjiException
@@ -23,6 +21,7 @@ from benji.storage.dicthmac import DictHMAC
 from benji.transform.base import TransformBase
 from benji.utils import TokenBucket, derive_key
 from benji.versions import VERSIONS
+from diskcache import FanoutCache
 
 
 class InvalidBlockException(BenjiException, IOError):
@@ -72,8 +71,8 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
             for transform in active_transforms:
                 self._active_transforms.append(TransformFactory.get_by_name(transform))
             logger.info('Active transforms for storage {}: {}.'.format(
-                name, ', '.join(
-                    ['{} ({})'.format(transform.name, transform.module) for transform in self._active_transforms])))
+                name,
+                ', '.join(['{} ({})'.format(transform.name, transform.module) for transform in self._active_transforms])))
 
         simultaneous_writes = Config.get_from_dict(module_configuration, 'simultaneousWrites', types=int)
         simultaneous_reads = Config.get_from_dict(module_configuration, 'simultaneousReads', types=int)
@@ -81,8 +80,10 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
         bandwidth_read = Config.get_from_dict(module_configuration, 'bandwidthRead', types=int)
         bandwidth_write = Config.get_from_dict(module_configuration, 'bandwidthWrite', types=int)
 
-        self._consistency_check_writes = Config.get_from_dict(
-            module_configuration, 'consistencyCheckWrites', False, types=bool)
+        self._consistency_check_writes = Config.get_from_dict(module_configuration,
+                                                              'consistencyCheckWrites',
+                                                              False,
+                                                              types=bool)
 
         hmac_key_encoded = Config.get_from_dict(module_configuration, 'hmac.key', None, types=str)
         hmac_key: Optional[bytes] = None
@@ -91,8 +92,10 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
             if hmac_password is not None:
                 hmac_kdf_salt = base64.b64decode(Config.get_from_dict(module_configuration, 'hmac.kdfSalt', types=str))
                 hmac_kdf_iterations = Config.get_from_dict(module_configuration, 'hmac.kdfIterations', types=int)
-                hmac_key = derive_key(
-                    salt=hmac_kdf_salt, iterations=hmac_kdf_iterations, key_length=32, password=hmac_password)
+                hmac_key = derive_key(salt=hmac_kdf_salt,
+                                      iterations=hmac_kdf_iterations,
+                                      key_length=32,
+                                      password=hmac_password)
         else:
             hmac_key = base64.b64decode(hmac_key_encoded)
         self._dict_hmac: Optional[DictHMAC] = None
@@ -182,8 +185,10 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
     def _write(self, block: DereferencedBlock, data: bytes) -> DereferencedBlock:
         data, transforms_metadata = self._encapsulate(data)
 
-        metadata, metadata_json = self._build_metadata(
-            size=block.size, object_size=len(data), checksum=block.checksum, transforms_metadata=transforms_metadata)
+        metadata, metadata_json = self._build_metadata(size=block.size,
+                                                       object_size=len(data),
+                                                       checksum=block.checksum,
+                                                       transforms_metadata=transforms_metadata)
 
         key = block.uid.storage_object_to_path()
         metadata_key = key + self._META_SUFFIX
@@ -202,7 +207,7 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
             raise
         t2 = time.time()
 
-        logger.debug('{} wrote data of uid {} in {:.2f}s'.format(threading.current_thread().name, block.uid, t2 - t1))
+        logger.debug('{} wrote data of uid {} in {:.3f}s'.format(threading.current_thread().name, block.uid, t2 - t1))
 
         if self._consistency_check_writes:
             try:
@@ -261,7 +266,7 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
         if not metadata_only and self._TRANSFORMS_KEY in metadata:
             data = self._decapsulate(data, metadata[self._TRANSFORMS_KEY])  # type: ignore
 
-        logger.debug('{} read data of uid {} in {:.2f}s{}'.format(threading.current_thread().name, block.uid, t2 - t1,
+        logger.debug('{} read data of uid {} in {:.3f}s{}'.format(threading.current_thread().name, block.uid, t2 - t1,
                                                                   ' (metadata only)' if metadata_only else ''))
 
         return block, data, metadata
@@ -283,22 +288,20 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
     def check_block_metadata(self, *, block: DereferencedBlock, data_length: Optional[int], metadata: Dict) -> None:
         # Existence of keys has already been checked in _decode_metadata() and _read()
         if metadata[self._SIZE_KEY] != block.size:
-            raise ValueError(
-                'Mismatch between recorded block size and data length in object metadata for block {} (UID {}). '
-                'Expected: {}, got: {}.'.format(block.id, block.uid, block.size, metadata[self._SIZE_KEY]))
+            raise ValueError('Mismatch between recorded block size and data length in object metadata for block {} (UID {}). '
+                             'Expected: {}, got: {}.'.format(block.id, block.uid, block.size, metadata[self._SIZE_KEY]))
 
         if data_length and data_length != block.size:
             raise ValueError('Mismatch between recorded block size and actual data length for block {} (UID {}). '
                              'Expected: {}, got: {}.'.format(block.id, block.uid, block.size, data_length))
 
         if block.checksum != metadata[self._CHECKSUM_KEY]:
-            raise ValueError(
-                'Mismatch between recorded block checksum and checksum in object metadata for block {} (UID {}). '
-                'Expected: {}, got: {}.'.format(
-                    block.id,
-                    block.uid,
-                    cast(str, block.checksum)[:16],  # We know that block.checksum is set
-                    metadata[self._CHECKSUM_KEY][:16]))
+            raise ValueError('Mismatch between recorded block checksum and checksum in object metadata for block {} (UID {}). '
+                             'Expected: {}, got: {}.'.format(
+                                 block.id,
+                                 block.uid,
+                                 cast(str, block.checksum)[:16],  # We know that block.checksum is set
+                                 metadata[self._CHECKSUM_KEY][:16]))
 
     def _rm_block(self, uid: BlockUid) -> BlockUid:
         key = uid.storage_object_to_path()
@@ -345,7 +348,7 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
             if key.endswith(self._META_SUFFIX):
                 continue
             try:
-                yield cast(BlockUid, BlockUid.storage_path_to_object(key))
+                yield BlockUid.storage_path_to_object(key)
             except (RuntimeError, ValueError):
                 # Ignore any keys which don't match our pattern to account for stray objects/files
                 pass
@@ -357,7 +360,7 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
             if key.endswith(self._META_SUFFIX):
                 continue
             try:
-                yield cast(VersionUid, VersionUid.storage_path_to_object(key))
+                yield VersionUid.storage_path_to_object(key)
             except (RuntimeError, ValueError):
                 # Ignore any keys which don't match our pattern to account for stray objects/files
                 pass
@@ -395,8 +398,9 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
         size = len(data_bytes)
 
         data_bytes, transforms_metadata = self._encapsulate(data_bytes)
-        metadata, metadata_json = self._build_metadata(
-            size=size, object_size=len(data_bytes), transforms_metadata=transforms_metadata)
+        metadata, metadata_json = self._build_metadata(size=size,
+                                                       object_size=len(data_bytes),
+                                                       transforms_metadata=transforms_metadata)
 
         try:
             self._write_object(key, data_bytes)

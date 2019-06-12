@@ -5,7 +5,6 @@ from typing import Dict, NamedTuple, Any
 from urllib import parse
 
 from benji.config import Config, ConfigList
-
 from benji.exception import ConfigurationError, InternalError, UsageError
 from benji.io.base import IOBase
 from benji.repr import ReprMixIn
@@ -46,26 +45,21 @@ class StorageFactory(ReprMixIn):
             if storage_id in cls._storage_id_to_name:
                 raise ConfigurationError('Duplicate id {} in list {}.'.format(storage_id, modules.full_name))
 
+            module = importlib.import_module('{}.{}.{}'.format(__package__, cls._MODULE, module))
             try:
-                module = importlib.import_module('{}.{}.{}'.format(__package__, cls._MODULE, module))
-            except ImportError:
-                raise ConfigurationError('Module file {}.{}.{} not found or related import error.'.format(
-                    __package__, cls._MODULE, module))
-            else:
-                try:
-                    configuration = config.validate(module=module.__name__, config=configuration)
-                except ConfigurationError as exception:
-                    raise ConfigurationError('Configuration for storage {} is invalid.'.format(name)) from exception
-                cls._modules[storage_id] = _StorageFactoryModule(
-                    module=module,
-                    arguments={
-                        'config': config,
-                        'name': name,
-                        'storage_id': storage_id,
-                        'module_configuration': configuration
-                    })
-                cls._name_to_storage_id[name] = storage_id
-                cls._storage_id_to_name[storage_id] = name
+                configuration = config.validate(module=module.__name__, config=configuration)
+            except ConfigurationError as exception:
+                raise ConfigurationError('Configuration for storage {} is invalid.'.format(name)) from exception
+            cls._modules[storage_id] = _StorageFactoryModule(
+                module=module,
+                arguments={
+                    'config': config,
+                    'name': name,
+                    'storage_id': storage_id,
+                    'module_configuration': configuration
+                })
+            cls._name_to_storage_id[name] = storage_id
+            cls._storage_id_to_name[storage_id] = name
 
     @classmethod
     def initialize(cls, config: Config) -> None:
@@ -142,22 +136,17 @@ class TransformFactory(ReprMixIn):
             if name in cls._modules:
                 raise ConfigurationError('Duplicate name "{}" in list {}.'.format(name, modules.full_name))
 
+            module = importlib.import_module('{}.{}.{}'.format(__package__, cls._MODULE, module))
             try:
-                module = importlib.import_module('{}.{}.{}'.format(__package__, cls._MODULE, module))
-            except ImportError:
-                raise ConfigurationError('Module file {}.{}.{} not found or related import error.'.format(
-                    __package__, cls._MODULE, module))
-            else:
-                try:
-                    configuration = config.validate(module=module.__name__, config=configuration)
-                except ConfigurationError as exception:
-                    raise ConfigurationError('Configuration for transform {} is invalid.'.format(name)) from exception
-                cls._modules[name] = _StorageFactoryModule(
-                    module=module, arguments={
-                        'config': config,
-                        'name': name,
-                        'module_configuration': configuration
-                    })
+                configuration = config.validate(module=module.__name__, config=configuration)
+            except ConfigurationError as exception:
+                raise ConfigurationError('Configuration for transform {} is invalid.'.format(name)) from exception
+            cls._modules[name] = _StorageFactoryModule(
+                module=module, arguments={
+                    'config': config,
+                    'name': name,
+                    'module_configuration': configuration
+                })
 
     @classmethod
     def initialize(cls, config: Config) -> None:
@@ -205,22 +194,17 @@ class IOFactory(ReprMixIn):
             if name in cls._modules:
                 raise ConfigurationError('Duplicate name "{}" in list {}.'.format(name, modules.full_name))
 
+            module = importlib.import_module('{}.{}.{}'.format(__package__, cls._MODULE, module))
             try:
-                module = importlib.import_module('{}.{}.{}'.format(__package__, cls._MODULE, module))
-            except ImportError:
-                raise ConfigurationError('Module file {}.{}.{} not found or related import error.'.format(
-                    __package__, cls._MODULE, module))
-            else:
-                try:
-                    configuration = config.validate(module=module.__name__, config=configuration)
-                except ConfigurationError as exception:
-                    raise ConfigurationError('Configuration for IO {} is invalid.'.format(name)) from exception
-                cls._modules[name] = _StorageFactoryModule(
-                    module=module, arguments={
-                        'config': config,
-                        'name': name,
-                        'module_configuration': configuration
-                    })
+                configuration = config.validate(module=module.__name__, config=configuration)
+            except ConfigurationError as exception:
+                raise ConfigurationError('Configuration for IO {} is invalid.'.format(name)) from exception
+            cls._modules[name] = _StorageFactoryModule(
+                module=module, arguments={
+                    'config': config,
+                    'name': name,
+                    'module_configuration': configuration
+                })
 
     @classmethod
     def initialize(cls, config: Config) -> None:
@@ -233,12 +217,9 @@ class IOFactory(ReprMixIn):
 
     @classmethod
     def get(cls, url: str, block_size: int) -> IOBase:
-        res = parse.urlparse(url)
+        parsed_url = parse.urlparse(url)
 
-        if res.params or res.query or res.fragment:
-            raise UsageError('The supplied URL {} is invalid.'.format(url))
-
-        name = res.scheme
+        name = parsed_url.scheme
         if not name:
             raise UsageError('The supplied URL {} is invalid. You must provide a scheme.'.format(url))
         if name not in cls._modules:
@@ -246,6 +227,6 @@ class IOFactory(ReprMixIn):
 
         module = cls._modules[name].module
         module_arguments = cls._modules[name].arguments.copy()
-        module_arguments['path'] = res.netloc + res.path
+        module_arguments['url'] = url
         module_arguments['block_size'] = block_size
         return module.IO(**module_arguments)
