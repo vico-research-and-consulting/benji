@@ -1,8 +1,8 @@
-import fileinput
 import json
+import logging
 import os
 import sys
-from typing import List, NamedTuple, Type, Optional, Tuple
+from typing import List, NamedTuple, Type, Optional
 
 from prettytable import PrettyTable
 
@@ -30,7 +30,7 @@ class Commands:
         self.config = config
 
     def backup(self, version_name: str, snapshot_name: str, source: str, rbd_hints: str, base_version_uid: str,
-               block_size: int, labels: List[str], storage) -> None:
+               block_size: int, labels: List[str], storage: str) -> None:
         # Validate version_name and snapshot_name
         if not InputValidation.is_backup_name(version_name):
             raise benji.exception.UsageError('Version name {} is invalid.'.format(version_name))
@@ -38,16 +38,15 @@ class Commands:
             raise benji.exception.UsageError('Snapshot name {} is invalid.'.format(snapshot_name))
         base_version_uid_obj = VersionUid(base_version_uid) if base_version_uid else None
         if labels:
-            label_add, label_remove = self._parse_labels(labels)
-            if label_remove:
-                raise benji.exception.UsageError('Wanting to delete labels on a new version is senseless.')
+            label_add, label_remove = InputValidation.parse_and_validate_labels(labels)
         benji_obj = None
         try:
             benji_obj = Benji(self.config, block_size=block_size)
             hints = None
             if rbd_hints:
-                data = ''.join([line for line in fileinput.input(rbd_hints).readline()])
-                hints = hints_from_rbd_diff(data)
+                logger.debug(f'Loading RBD hints from file {rbd_hints}.')
+                with open(rbd_hints, 'r') as f:
+                    hints = hints_from_rbd_diff(f.read())
             backup_version = benji_obj.backup(version_name, snapshot_name, source, hints, base_version_uid_obj, storage)
 
             if labels:
@@ -64,23 +63,24 @@ class Commands:
                                                                                ', '.join(label_remove)))
 
             if self.machine_output:
-                benji_obj.export_any({
-                    'versions': [backup_version]
-                },
+                benji_obj.export_any({'versions': [backup_version]},
                                      sys.stdout,
                                      ignore_relationships=[((Version,), ('blocks',))])
         finally:
             if benji_obj:
                 benji_obj.close()
 
-    def restore(self, version_uid: str, destination: str, sparse: bool, force: bool,
-                database_backend_less: bool) -> None:
+    def restore(self, version_uid: str, destination: str, sparse: bool, force: bool, database_less: bool,
+                storage: str) -> None:
+        if not database_less and storage is not None:
+            raise benji.exception.UsageError('Specifying a storage location is only supported for database-less restores.')
+
         version_uid_obj = VersionUid(version_uid)
         benji_obj = None
         try:
-            benji_obj = Benji(self.config, in_memory_database=database_backend_less)
-            if database_backend_less:
-                benji_obj.metadata_restore([version_uid_obj])
+            benji_obj = Benji(self.config, in_memory_database=database_less)
+            if database_less:
+                benji_obj.metadata_restore([version_uid_obj], storage)
             benji_obj.restore(version_uid_obj, destination, sparse, force)
         finally:
             if benji_obj:
@@ -115,12 +115,11 @@ class Commands:
         try:
             benji_obj = Benji(self.config)
             for version_uid in version_uid_objs:
-                benji_obj.rm(
-                    version_uid,
-                    force=force,
-                    disallow_rm_when_younger_than_days=disallow_rm_when_younger_than_days,
-                    keep_metadata_backup=keep_metadata_backup,
-                    override_lock=override_lock)
+                benji_obj.rm(version_uid,
+                             force=force,
+                             disallow_rm_when_younger_than_days=disallow_rm_when_younger_than_days,
+                             keep_metadata_backup=keep_metadata_backup,
+                             override_lock=override_lock)
         finally:
             if benji_obj:
                 benji_obj.close()
@@ -134,12 +133,13 @@ class Commands:
         except benji.exception.ScrubbingError:
             assert benji_obj is not None
             if self.machine_output:
-                benji_obj.export_any({
-                    'versions': benji_obj.ls(version_uid=version_uid_obj),
-                    'errors': benji_obj.ls(version_uid=version_uid_obj)
-                },
-                                     sys.stdout,
-                                     ignore_relationships=[((Version,), ('blocks',))])
+                benji_obj.export_any(
+                    {
+                        'versions': benji_obj.ls(version_uid=version_uid_obj),
+                        'errors': benji_obj.ls(version_uid=version_uid_obj)
+                    },
+                    sys.stdout,
+                    ignore_relationships=[((Version,), ('blocks',))])
             raise
         else:
             if self.machine_output:
@@ -162,12 +162,13 @@ class Commands:
         except benji.exception.ScrubbingError:
             assert benji_obj is not None
             if self.machine_output:
-                benji_obj.export_any({
-                    'versions': benji_obj.ls(version_uid=version_uid_obj),
-                    'errors': benji_obj.ls(version_uid=version_uid_obj)
-                },
-                                     sys.stdout,
-                                     ignore_relationships=[((Version,), ('blocks',))])
+                benji_obj.export_any(
+                    {
+                        'versions': benji_obj.ls(version_uid=version_uid_obj),
+                        'errors': benji_obj.ls(version_uid=version_uid_obj)
+                    },
+                    sys.stdout,
+                    ignore_relationships=[((Version,), ('blocks',))])
             raise
         else:
             if self.machine_output:
@@ -278,9 +279,7 @@ class Commands:
 
             if self.machine_output:
                 benji_obj.export_any(
-                    {
-                        'versions': versions
-                    },
+                    {'versions': versions},
                     sys.stdout,
                     ignore_relationships=[((Version,), ('blocks',))],
                 )
@@ -374,45 +373,9 @@ class Commands:
             if benji_obj:
                 benji_obj.close()
 
-    @staticmethod
-    def _parse_labels(labels: List[str]) -> Tuple[List[Tuple[str, str]], List[str]]:
-        add_list: List[Tuple[str, str]] = []
-        remove_list: List[str] = []
-        for label in labels:
-            if len(label) == 0:
-                raise benji.exception.UsageError('A zero-length label is invalid.')
-
-            if label.endswith('-'):
-                name = label[:-1]
-
-                if not InputValidation.is_label_name(name):
-                    raise benji.exception.UsageError('Label name {} is invalid.'.format(name))
-
-                remove_list.append(name)
-            elif label.find('=') > -1:
-                name, value = label.split('=')
-
-                if len(name) == 0:
-                    raise benji.exception.UsageError('Missing label key in label {}.'.format(label))
-                if not InputValidation.is_label_name(name):
-                    raise benji.exception.UsageError('Label name {} is invalid.'.format(name))
-                if not InputValidation.is_label_value(value):
-                    raise benji.exception.UsageError('Label value {} is not a valid.'.format(value))
-
-                add_list.append((name, value))
-            else:
-                name = label
-
-                if not InputValidation.is_label_name(name):
-                    raise benji.exception.UsageError('Label name {} is invalid.'.format(name))
-
-                add_list.append((name, ''))
-
-        return add_list, remove_list
-
     def label(self, version_uid: str, labels: List[str]) -> None:
         version_uid_obj = VersionUid(version_uid)
-        label_add, label_remove = self._parse_labels(labels)
+        label_add, label_remove = InputValidation.parse_and_validate_labels(labels)
         benji_obj = None
         try:
             benji_obj = Benji(self.config)
@@ -443,12 +406,11 @@ class Commands:
         benji_obj = None
         try:
             benji_obj = Benji(self.config)
-            dismissed_versions = benji_obj.enforce_retention_policy(
-                filter_expression=filter_expression,
-                rules_spec=rules_spec,
-                dry_run=dry_run,
-                keep_metadata_backup=keep_metadata_backup,
-                group_label=group_label)
+            dismissed_versions = benji_obj.enforce_retention_policy(filter_expression=filter_expression,
+                                                                    rules_spec=rules_spec,
+                                                                    dry_run=dry_run,
+                                                                    keep_metadata_backup=keep_metadata_backup,
+                                                                    group_label=group_label)
             if self.machine_output:
                 benji_obj.export_any({
                     'versions': dismissed_versions,
@@ -482,7 +444,7 @@ class Commands:
             logger.info('Object metadata version: {}, supported {}.'.format(VERSIONS.object_metadata.current,
                                                                             VERSIONS.object_metadata.supported))
         else:
-            versions = {
+            result = {
                 'version': __version__,
                 'configuration_version': {
                     'current': str(VERSIONS.configuration.current),
@@ -497,7 +459,7 @@ class Commands:
                     'supported': str(VERSIONS.object_metadata.supported)
                 },
             }
-            print(json.dumps(versions, indent=4))
+            print(json.dumps(result, indent=4))
 
     @staticmethod
     def _ls_storage_stats_table_output(objects_count: int, objects_size: int) -> None:
@@ -522,12 +484,20 @@ class Commands:
             objects_count, objects_size = benji_obj.storage_stats(storage_name)
 
             if self.machine_output:
-                benji_obj.export_any({
+                result = {
                     'objects_count': objects_count,
                     'objects_size': objects_size,
-                }, sys.stdout)
+                }
+                print(json.dumps(result, indent=4))
             else:
                 self._ls_storage_stats_table_output(objects_count, objects_size)
         finally:
             if benji_obj:
                 benji_obj.close()
+
+    def rest_api(self, bind_address: str, bind_port: int) -> None:
+        from benji.restapi import RestAPI
+        api = RestAPI(self.config)
+        logger.info(f'Starting REST API via gunicorn on {bind_address}:{bind_port}.')
+        debug = bool(logger.isEnabledFor(logging.DEBUG))
+        api.run(bind_address=bind_address, bind_port=bind_port, debug=debug)

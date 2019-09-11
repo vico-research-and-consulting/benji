@@ -61,7 +61,7 @@ Topic :: System :: Archiving :: Backup
         'cerberus>=1.2,<2',
         'pycryptodome>=3.6.1,<4',
         'pyparsing>=2.3.0,<3',
-        'semantic_version>=2.6.0,<3',
+        'semantic_version>=2.8.1,<3',
         'dateparser>=0.7.0,<1',
         'structlog>=19.1.0',
         'colorama>=0.4.1,<1',
@@ -69,13 +69,15 @@ Topic :: System :: Archiving :: Backup
     ],
     extras_require={
         's3': ['boto3>=1.7.28'],
-        'b2': ['b2>=1.3.2'],
+        'b2': ['b2>=1.3.2,<=1.3.8'],
         'compression': ['zstandard>=0.9.0'],
         # For RBD support the packages supplied by the Linux distribution or the Ceph team should be used,
         # possible packages names include: python-rados, python-rbd or python3-rados, python3-rbd
-        #'RBD support': ['rados', 'rbd'],
+        #'rbd': ['rados', 'rbd'],
         'dev': ['parameterized', 'wheel', 'yapf', 'mypy'],
         'doc': ['sphinx', 'sphinx_rtd_theme', 'sphinxcontrib-programoutput'],
+        'helpers': ['blinker>=1.4,<2', 'prometheus_client>=0.7.0,<1', 'kubernetes>=10.0.0,<11'],
+        'rest-api': ['bottle>=0.12.16,<1', 'gunicorn>=19.9.0,<20', 'webargs>=5.3.1,<6'],
     },
     python_requires='~=3.6',
     entry_points="""

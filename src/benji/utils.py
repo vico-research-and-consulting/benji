@@ -3,7 +3,6 @@
 import concurrent
 import json
 import re
-import setproctitle
 import sys
 from ast import literal_eval
 from concurrent.futures import Future
@@ -13,12 +12,13 @@ from threading import Lock
 from time import time
 from typing import List, Tuple, Union, Any, Optional, Dict, Iterator
 
+import setproctitle
 from Crypto.Hash import SHA512
 from Crypto.Protocol.KDF import PBKDF2
 from dateutil import tz
 from dateutil.relativedelta import relativedelta
 
-from benji.exception import ConfigurationError
+from benji.exception import ConfigurationError, UsageError
 from benji.logging import logger
 
 
@@ -30,7 +30,7 @@ def hints_from_rbd_diff(rbd_diff: str) -> List[Tuple[int, int, bool]]:
 
 
 # old_msg is used as a stateful storage between calls
-def notify(process_name: str, msg: str = '', old_msg: str = ''):
+def notify(process_name: str, msg: str = '', old_msg: str = '') -> None:
     """ This method can receive notifications and append them in '[]' to the
     process name seen in ps, top, ...
     """
@@ -48,7 +48,8 @@ def notify(process_name: str, msg: str = '', old_msg: str = ''):
 # Indeed it's so tricky that older Python versions had the same problem. See https://bugs.python.org/issue27144.
 def future_results_as_completed(futures: List[Future], semaphore=None, timeout: int = None) -> Iterator[Any]:
     if sys.version_info < (3, 6, 4):
-        logger.warning('Large backup jobs are likely to fail because of excessive memory usage. ' + 'Upgrade your Python to at least 3.6.4.')
+        logger.warning('Large backup jobs are likely to fail because of excessive memory usage. ' +
+                       'Upgrade your Python to at least 3.6.4.')
 
     for future in concurrent.futures.as_completed(futures, timeout=timeout):
         futures.remove(future)
@@ -92,8 +93,7 @@ class BlockHash:
         try:
             hash = hash_module.new(**hash_kwargs)
         except (TypeError, ValueError) as exception:
-            raise ConfigurationError(
-                'Unsupported or invalid block hash arguments: {}.'.format(hash_kwargs)) from exception
+            raise ConfigurationError('Unsupported or invalid block hash arguments: {}.'.format(hash_kwargs)) from exception
 
         from benji.database import Block
         if len(hash.digest()) > Block.MAXIMUM_CHECKSUM_LENGTH:
@@ -217,3 +217,39 @@ class InputValidation:
             return True
         else:
             return re.fullmatch(cls.QUALIFIED_NAME_REGEXP, name) is not None
+
+    @staticmethod
+    def parse_and_validate_labels(labels: List[str]) -> Tuple[List[Tuple[str, str]], List[str]]:
+        add_list: List[Tuple[str, str]] = []
+        remove_list: List[str] = []
+        for label in labels:
+            if len(label) == 0:
+                raise UsageError('A zero-length label is invalid.')
+
+            if label.endswith('-'):
+                name = label[:-1]
+
+                if not InputValidation.is_label_name(name):
+                    raise UsageError('Label name {} is invalid.'.format(name))
+
+                remove_list.append(name)
+            elif label.find('=') > -1:
+                name, value = label.split('=')
+
+                if len(name) == 0:
+                    raise UsageError('Missing label key in label {}.'.format(label))
+                if not InputValidation.is_label_name(name):
+                    raise UsageError('Label name {} is invalid.'.format(name))
+                if not InputValidation.is_label_value(value):
+                    raise UsageError('Label value {} is not a valid.'.format(value))
+
+                add_list.append((name, value))
+            else:
+                name = label
+
+                if not InputValidation.is_label_name(name):
+                    raise UsageError('Label name {} is invalid.'.format(name))
+
+                add_list.append((name, ''))
+
+        return add_list, remove_list

@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+import argparse
+import logging
+import sys
+import time
+
+import kubernetes
+from kubernetes.client.rest import ApiException
+
+import benji.helpers.kubernetes
+import benji.helpers.settings as settings
+import benji.helpers.utils as utils
+
+utils.setup_logging()
+logger = logging.getLogger()
+
+parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter, allow_abbrev=False)
+
+parser.add_argument('-f',
+                    '--force',
+                    dest='force',
+                    action='store_true',
+                    default=False,
+                    help='Overwrite content of existing persistent volumes')
+parser.add_argument(metavar='version', dest='version', help='Version name')
+parser.add_argument(metavar='pvc_namespace', dest='pvc_namespace', help='PVC namespace')
+parser.add_argument(metavar='pvc_name', dest='pvc_name', help='PVC name')
+
+args = parser.parse_args()
+
+benji.helpers.kubernetes.load_config()
+core_v1_api = kubernetes.client.CoreV1Api()
+
+logger.info(f'Restoring version {args.version} to PVC {args.pvc_namespace}/{args.pvc_name}.')
+
+benji_ls = utils.subprocess_run(
+    ['benji', '--machine-output', '--log-level', settings.benji_log_level, 'ls', f'uid == "{args.version}"'],
+    decode_json=True)
+assert isinstance(benji_ls, dict)
+assert 'versions' in benji_ls
+assert isinstance(benji_ls['versions'], list)
+
+if len(benji_ls['versions']) == 0:
+    raise RuntimeError(f'Size of {args.version} could not be determined.')
+
+assert isinstance(benji_ls['versions'][0], dict)
+assert isinstance(benji_ls['versions'][0]['size'], int)
+version_size = benji_ls['versions'][0]['size']
+
+# This assumes that the Kubernetes client has already been initialized
+core_v1_api = kubernetes.client.CoreV1Api()
+pvc = None
+try:
+    pvc = core_v1_api.read_namespaced_persistent_volume_claim(args.pvc_name, args.pvc_namespace)
+except ApiException as exception:
+    if exception.status != 404:
+        raise RuntimeError(f'Unexpected Kubernetes API exception: {str(exception)}')
+
+if pvc is None:
+    pvc = benji.helpers.kubernetes.create_pvc(args.pvc_name, args.pvc_namespace, version_size)
+else:
+    if not args.force:
+        raise RuntimeError('PVC already exists. Will not overwrite it unless forced.')
+
+    # I don't really understand why capacity is a regular dict and not an object. Oh, well.
+    pvc_size = benji.helpers.kubernetes.parse_quantity(pvc.status.capacity['storage'])
+    if pvc_size < version_size:
+        raise RuntimeError(f'Existing PVC is too small to hold version {args.version} ({pvc_size} < {version_size}).')
+
+while True:
+    pvc = core_v1_api.read_namespaced_persistent_volume_claim(args.pvc_name, args.pvc_namespace)
+    if pvc.status.phase == 'Bound':
+        break
+    logger.info('Waiting for persistent volume creation.')
+    time.sleep(1)
+
+pv = core_v1_api.read_persistent_volume(pvc.spec.volume_name)
+
+utils.subprocess_run([
+    'benji', '--log-level', settings.benji_log_level, 'restore', '--sparse', '--force', args.version,
+    f'rbd:{pv.spec.rbd.pool}/{pv.spec.rbd.image}'
+])
+sys.exit(0)
