@@ -86,11 +86,11 @@ NBD Server
 
 .. command-output:: benji nbd --help
 
-Benji comes with its own NBD server which when started exports all known *versions*. These *versions* can then be
+Benji comes with its own NBD server which when started exports all known *versions*. The *versions* can then be
 mounted on any Linux host. The requirements on the Linux host are:
 
 - loaded ``nbd`` kernel module (``modprobe nbd`` as root)
-- installed ``nbd-client`` program (RPM package ``nbd`` on RHEL/CentOS7/Fedora)
+- installed ``nbd-client`` program (RPM package ``nbd`` on RHEL, CentOS and Fedora)
 
 The ``nbd-client`` contacts Benji's NBD server and connects an exported *version* to am NBD block device (``/dev/nbd*``)
 on the Linux host. If the image contains a filesystem it can be mounted normally. You can then search for the relevant
@@ -98,8 +98,10 @@ files and restore them.
 
 There are some known issues with ``nbd-client``:
 
-* Some problems have been reported with ``nbd-client`` 3.18. Please see https://github.com/elemental-lf/benji/issues/12.
-  Older versions like 3.16 and 3.17 (needs ``-t``, see below) and newer versions like 3.19 seems to be fine.
+* There have been numerous problems with different versions of ``nbd-client`` when used together with Benji. Recent
+  findings (11/18/2019) suggest that a bug in ``nbd-client`` introduced in `this commit <https://github.com/NetworkBlockDevice/nbd/commit/3c81389684bc2a4c86b4a744e8e97c6da354c44e>`_
+  and fixed `in this commit <https://github.com/NetworkBlockDevice/nbd/commit/d5b2a76775803ea7d6378a8e9caa58d756b30940>`_
+  was the reason for most of them. Benji versions 0.8.0 and newer contain a workaround for this bug.
 
 * Some versions of ``nbd-client`` (like 3.17) use a timeout value of zero which also leads to problems. Please
   explicitly specify a timeout with ``-t`` in these cases. To make the confusion complete some distributions have
@@ -127,7 +129,7 @@ by using ``nbd-client`` und the in-kernel ``nbd`` driver::
     $ sudo modprobe nbd
 
     # Connect a Benji version to a free NBD block device
-    $ sudo nbd-client -N V0000000001 127.0.0.1 -p 10809 -b 512 -t 10 /dev/nbd0
+    $ sudo nbd-client -p 10809 -b 512 -t 10 -N V0000000001 127.0.0.1  /dev/nbd0
     Negotiation: ..size = 10MB
     bs=512, sz=10485760 bytes
 
@@ -164,6 +166,8 @@ reachable from the outside bind it to 0.0.0.0 or the specific address of another
     benji nbd -a 0.0.0.0 -r
 
 
+.. CAUTION:: Exposing the NBD server on an external interface has security implications.
+
 Read-Write Mount
 ~~~~~~~~~~~~~~~~
 
@@ -192,14 +196,14 @@ The newly created *version* can be seen in the output of ``benji ls``::
     $ benji ls
         INFO: $ benji ls
     +---------------------+-------------+------+-----------------------------------------+----------+------------+-------+-----------+------+
-    |         date        |     uid     | name | snapshot_name                           |     size | block_size | valid | protected | tags |
+    |         date        |     uid     | name | snapshot                                |     size | block_size | valid | protected | tags |
     +---------------------+-------------+------+-----------------------------------------+----------+------------+-------+-----------+------+
     | 2018-06-10T01:00:43 | V0000000001 | test |                                         | 41943040 |    4194304 |  True |   False   |      |
     | 2018-06-10T01:01:16 | V0000000002 | test | nbd-cow-V0000000001-2018-06-10T01:01:16 | 41943040 |    4194304 |  True |    True   |      |
     +---------------------+-------------+------+-----------------------------------------+----------+------------+-------+-----------+------+
 
-The name will be the same as the original *version*. The snapshot_name will start with the prefix *nbd-cow-* followed
-by the *version* UID followed by a timestamp.
+The name will be the same as the original *version*. The snapshot will start with the prefix *nbd-cow-* followed by the 
+*version* UID followed by a timestamp.
 
 The COW *version* will automatically be marked as protected by Benji to prevent removal by any automatic retention
 policy enforcement configured. This ensures the new *version* won't be destroyed accidentally. To be able to remove

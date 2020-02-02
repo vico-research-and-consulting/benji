@@ -184,7 +184,9 @@ Reference to a storage module name. See below.
 * type: integer
 * default: none
 
-This sets the internal storage id for this storage configuration.
+This sets the internal storage id for this storage configuration. It is no longer necessary to populate
+this configuration key as the storage id is now assigned automatically. This option only exists for
+backward compatibility with older configurations and should not be used in new configurations.
 
 * key: **configuration**
 * type: list of dictionaries
@@ -474,9 +476,13 @@ bucket algorithm.  A value of ``0`` disables this feature.
 * type: list of strings
 * default: empty list
 
-Sets a list of transform which are applied to each data object before it is
-written to the storage. The transformations are performed in order. In
-forward direction when writing data and in reverse direction when reading.
+Sets a list of transformations which are applied to each data object before it is
+written to the storage. The transformations are performed in order from first to
+last when writing to the storage. On read the list of transformations recorded in
+the object's metadata is used in reverse order to decode the data. This makes
+it possible to change the list of ``activeTransforms`` and so enable compression or
+encryption even when there are data objects present in a storage already. The changed
+transformation list will only be applied to new data objects.
 
 * name: **consistencyCheckWrites**
 * type: bool
@@ -695,6 +701,17 @@ option are mutually exclusive.
 Sets the application key from a file. This option and the **applicationKey**
 option are mutually exclusive.
 
+* name: **accountInfoFile**
+* type: string
+* default: none
+
+Sets the file for caching the authorization token.  If unset, the `b2` module
+will always authorize the user with the provided account id and application
+key.  But the latter operation is rate limited by BackBlaze, so if Benji is
+invoked repeatably in a short time frame the login will fail. In this case
+configure  this option to cache and use the authorization token in subsequent
+calls of  Benji. The token will be renewed automatically when it expires.
+
 * name: **bucketName**
 * type: string
 * required
@@ -724,15 +741,36 @@ retry reads this number of times.
 NBD
 ---
 
-Configuration options pertaining to Benji's NBD server are located under
-the top-level key **nbd**:
+Configuration options pertaining to Benji's NBD server are located under the top-level key **nbd**.
+While the defaults are suitable for testing they are not suitable for a production use of the NBD server
+functionality as ``/tmp`` generally is RAM disk today.
 
-The only configuration option currently present in the **nbd** dictionary
-is:
+The block cache is bounded by the maximum size setting. The copy-on-write store is only used if data
+is written to an NBD device and a copy-on-write *version* is created. It holds all the blocks that have
+changed and will be cleaned up when the NBD device is detached and all the changed blocks have been
+written into the COW *version*. This means that it can grow up to the size of all *versions* that
+are attached to an NBD device in read-write mode at a time.
 
-* name: **directory**
+Benji's NBD server is not protected by any form of authentication and the traffic between the NBD server
+and client is not encrypted. That is why the NBD server only listens on ``localhost`` by default.
+
+* name: **blockCache.directory**
 * type: string
-* default: ``/tmp``
+* default: ``/tmp/benji/nbd/block-cache``
+
+Sets the base directory for the block cache
+
+* name: **blockCache.maximumSize**
+* type: integer
+* default: ``2126512128``
+
+Sets the approximate maximum size of the block cache. The default is 2GB.
+
+* name: **cowStore.directory**
+* type: string
+* default: ``/tmp/benji/nbd/cow-store``
+
+Sets the base directory for the copy-on-wrote storage area.
 
 Multiple Instance Installations
 -------------------------------

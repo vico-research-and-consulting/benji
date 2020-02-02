@@ -3,10 +3,11 @@ import datetime
 import json
 import os
 import random
+import uuid
 from io import StringIO
 from unittest import TestCase
 
-from benji.database import VersionUid, VersionStatus
+from benji.database import VersionUid, VersionStatus, Block, Label
 from benji.logging import logger
 from benji.tests.testcase import BenjiTestCaseBase
 from benji.utils import hints_from_rbd_diff
@@ -29,7 +30,6 @@ class ImportExportTestCase():
             f.write(data)
 
     def generate_versions(self, testpath):
-        base_version = None
         version_uids = []
         old_size = 0
         init_database = True
@@ -68,8 +68,11 @@ class ImportExportTestCase():
             benji_obj = self.benjiOpen(init_database=init_database)
             init_database = False
             with open(os.path.join(testpath, 'hints')) as hints:
-                version = benji_obj.backup('data-backup', 'snapshot-name', 'file:' + image_filename,
-                                           hints_from_rbd_diff(hints.read()), base_version)
+                version = benji_obj.backup(version_uid=VersionUid(str(uuid.uuid4())),
+                                           volume='data-backup',
+                                           snapshot='snapshot-name',
+                                           source='file:' + image_filename,
+                                           hints=hints_from_rbd_diff(hints.read()))
             version_uids.append((version.uid, size))
             benji_obj.close()
         return version_uids
@@ -96,41 +99,42 @@ class ImportExportTestCase():
         self.assertIsInstance(export['versions'], list)
         self.assertTrue(len(export['versions']) == 3)
         version = export['versions'][0]
-        self.assertEqual(1, version['uid'])
-        self.assertEqual('data-backup', version['name'])
-        self.assertEqual('snapshot-name', version['snapshot_name'])
+        expected_version_uid = self.version_uids[0][0]
+        self.assertEqual(expected_version_uid, version['uid'])
+        self.assertEqual('data-backup', version['volume'])
+        self.assertEqual('snapshot-name', version['snapshot'])
         self.assertEqual(4096, version['block_size'])
         self.assertEqual(version['status'], VersionStatus.valid.name)
         self.assertFalse(version['protected'])
-        self.assertEqual(1, version['storage_id'])
+        self.assertEqual('file', version['storage'])
 
     def test_import_1_0_0(self):
         benji_obj = self.benjiOpen(init_database=True)
 
+        version_uid = VersionUid('V0000000001')
         benji_obj.metadata_import(StringIO(self.IMPORT_1_0_0))
-        version = benji_obj.ls(version_uid=VersionUid(1))[0]
+        version = benji_obj.ls(version_uid=version_uid)[0]
         self.assertTrue(isinstance(version.uid, VersionUid))
-        self.assertEqual(1, version.uid)
-        self.assertEqual('data-backup', version.name)
-        self.assertEqual('snapshot-name', version.snapshot_name)
+        self.assertEqual(version_uid, version.uid)
+        self.assertEqual('data-backup', version.volume)
+        self.assertEqual('snapshot-name', version.snapshot)
         self.assertEqual(4194304, version.block_size)
         self.assertEqual(version.status, VersionStatus.valid)
         self.assertFalse(version.protected)
         self.assertIsInstance(version.blocks, list)
-        self.assertIsInstance(version.labels, list)
+        self.assertIsInstance(version.labels, dict)
         self.assertEqual(datetime.datetime.strptime('2018-12-19T20:28:18.123456', '%Y-%m-%dT%H:%M:%S.%f'), version.date)
 
         self.assertIsNone(version.bytes_read)
         self.assertIsNone(version.bytes_written)
-        self.assertIsNone(version.bytes_dedup)
+        self.assertIsNone(version.bytes_deduplicated)
         self.assertIsNone(version.bytes_sparse)
         self.assertIsNone(version.duration)
 
-        blocks = list(benji_obj._database_backend.get_blocks_by_version(VersionUid(1)))
-        self.assertTrue(len(blocks) > 0)
-        block = blocks[0]
-        self.assertEqual(VersionUid(1), block.version_uid)
-        self.assertEqual(0, block.id)
+        self.assertTrue(len(version.blocks) > 0)
+        block = version.blocks[0]
+        self.assertEqual(version.id, block.version_id)
+        self.assertEqual(0, block.idx)
         self.assertEqual(670293, block.size)
         self.assertTrue(block.valid)
 
@@ -139,30 +143,86 @@ class ImportExportTestCase():
     def test_import_1_1_0(self):
         benji_obj = self.benjiOpen(init_database=True)
 
+        version_uid = VersionUid('V0000000001')
         benji_obj.metadata_import(StringIO(self.IMPORT_1_1_0))
-        version = benji_obj.ls(version_uid=VersionUid(1))[0]
+        version = benji_obj.ls(version_uid=version_uid)[0]
         self.assertTrue(isinstance(version.uid, VersionUid))
-        self.assertEqual(1, version.uid)
-        self.assertEqual('data-backup', version.name)
-        self.assertEqual('snapshot-name', version.snapshot_name)
+        self.assertEqual(version_uid, version.uid)
+        self.assertEqual('data-backup', version.volume)
+        self.assertEqual('snapshot-name', version.snapshot)
         self.assertEqual(4194304, version.block_size)
         self.assertEqual(version.status, VersionStatus.valid)
         self.assertFalse(version.protected)
         self.assertIsInstance(version.blocks, list)
-        self.assertIsInstance(version.labels, list)
+        self.assertIsInstance(version.labels, dict)
         self.assertEqual(datetime.datetime.strptime('2018-12-19T20:28:18.123456', '%Y-%m-%dT%H:%M:%S.%f'), version.date)
 
         self.assertEqual(1, version.bytes_read)
         self.assertEqual(2, version.bytes_written)
-        self.assertEqual(3, version.bytes_dedup)
+        self.assertEqual(3, version.bytes_deduplicated)
         self.assertEqual(4, version.bytes_sparse)
         self.assertEqual(5, version.duration)
 
-        blocks = list(benji_obj._database_backend.get_blocks_by_version(VersionUid(1)))
-        self.assertTrue(len(blocks) > 0)
-        block = blocks[0]
-        self.assertEqual(VersionUid(1), block.version_uid)
-        self.assertEqual(0, block.id)
+        for label in version.labels.values():
+            self.assertIsInstance(label, Label)
+
+        self.assertSetEqual({'label-1', 'label-2'}, set(version.labels.keys()))
+        self.assertEqual('label-1', version.labels['label-1'].name)
+        self.assertEqual('label-2', version.labels['label-2'].name)
+        self.assertEqual('bla', version.labels['label-1'].value)
+        self.assertEqual('blub', version.labels['label-2'].value)
+        self.assertEqual(version.id, version.labels['label-1'].version_id)
+        self.assertEqual(version.id, version.labels['label-2'].version_id)
+
+        self.assertTrue(len(version.blocks) > 0)
+        block = version.blocks[0]
+        self.assertIsInstance(block, Block)
+        self.assertEqual(version.id, block.version_id)
+        self.assertEqual(0, block.idx)
+        self.assertEqual(670293, block.size)
+        self.assertTrue(block.valid)
+
+        benji_obj.close()
+
+    def test_import_2_0_0(self):
+        benji_obj = self.benjiOpen(init_database=True)
+
+        version_uid = VersionUid('V0000000001')
+        benji_obj.metadata_import(StringIO(self.IMPORT_2_0_0))
+        version = benji_obj.ls(version_uid=version_uid)[0]
+        self.assertTrue(isinstance(version.uid, VersionUid))
+        self.assertEqual(version_uid, version.uid)
+        self.assertEqual('data-backup', version.volume)
+        self.assertEqual('snapshot-name', version.snapshot)
+        self.assertEqual(4194304, version.block_size)
+        self.assertEqual(version.status, VersionStatus.valid)
+        self.assertFalse(version.protected)
+        self.assertIsInstance(version.blocks, list)
+        self.assertIsInstance(version.labels, dict)
+        self.assertEqual(datetime.datetime.strptime('2018-12-19T20:28:18.123456', '%Y-%m-%dT%H:%M:%S.%f'), version.date)
+
+        self.assertEqual(1, version.bytes_read)
+        self.assertEqual(2, version.bytes_written)
+        self.assertEqual(3, version.bytes_deduplicated)
+        self.assertEqual(4, version.bytes_sparse)
+        self.assertEqual(5, version.duration)
+
+        for label in version.labels.values():
+            self.assertIsInstance(label, Label)
+
+        self.assertSetEqual({'label-1', 'label-2'}, set(version.labels.keys()))
+        self.assertEqual('label-1', version.labels['label-1'].name)
+        self.assertEqual('label-2', version.labels['label-2'].name)
+        self.assertEqual('bla', version.labels['label-1'].value)
+        self.assertEqual('blub', version.labels['label-2'].value)
+        self.assertEqual(version.id, version.labels['label-1'].version_id)
+        self.assertEqual(version.id, version.labels['label-2'].version_id)
+
+        self.assertTrue(len(version.blocks) > 0)
+        block = version.blocks[0]
+        self.assertIsInstance(block, Block)
+        self.assertEqual(version.id, block.version_id)
+        self.assertEqual(0, block.idx)
         self.assertEqual(670293, block.size)
         self.assertTrue(block.valid)
 
@@ -266,7 +326,16 @@ class ImportExportTestCase():
                   "bytes_dedup": 3,
                   "bytes_sparse": 4,
                   "duration": 5,
-                  "labels": [],
+                  "labels": [
+                    {
+                      "name": "label-1",
+                      "value": "bla"
+                    },
+                    {
+                      "name": "label-2",
+                      "value": "blub"
+                    }
+                  ],
                   "blocks": [
                     {
                       "uid": {
@@ -282,9 +351,9 @@ class ImportExportTestCase():
                 },
                 {
                   "uid": 2,
-                  "date": "2018-12-19T20:28:19.123456",
-                  "name": "test",
-                  "snapshot_name": "",
+                  "date": "2018-12-19T20:28:18.123456",
+                  "name": "data-backup",
+                  "snapshot_name": "snapshot-name",
                   "size": 670293,
                   "block_size": 4194304,
                   "storage_id": 1,
@@ -295,7 +364,16 @@ class ImportExportTestCase():
                   "bytes_dedup": 3,
                   "bytes_sparse": 4,
                   "duration": 5,
-                  "labels": [],
+                  "labels": [
+                    {
+                      "name": "label-1",
+                      "value": "bla"
+                    },
+                    {
+                      "name": "label-2",
+                      "value": "blub"
+                    }
+                  ],
                   "blocks": [
                     {
                       "uid": {
@@ -311,9 +389,9 @@ class ImportExportTestCase():
                 },
                 {
                   "uid": 3,
-                  "date": "2018-12-19T20:28:21.123456",
-                  "name": "test",
-                  "snapshot_name": "",
+                  "date": "2018-12-19T20:28:18.123456",
+                  "name": "data-backup",
+                  "snapshot_name": "snapshot-name",
                   "size": 670293,
                   "block_size": 4194304,
                   "storage_id": 1,
@@ -323,8 +401,17 @@ class ImportExportTestCase():
                   "bytes_written": 2,
                   "bytes_dedup": 3,
                   "bytes_sparse": 4,
-                  "duration": 5,                  
-                  "labels": [],
+                  "duration": 5,
+                  "labels": [
+                    {
+                      "name": "label-1",
+                      "value": "bla"
+                    },
+                    {
+                      "name": "label-2",
+                      "value": "blub"
+                    }
+                  ],
                   "blocks": [
                     {
                       "uid": {
@@ -340,6 +427,110 @@ class ImportExportTestCase():
                 }
               ],
               "metadata_version": "1.1.0"
+            }
+            """
+
+    IMPORT_2_0_0 = """
+            {
+              "versions": [
+                {
+                  "uid": "V0000000001",
+                  "date": "2018-12-19T20:28:18.123456Z",
+                  "volume": "data-backup",
+                  "snapshot": "snapshot-name",
+                  "size": 670293,
+                  "block_size": 4194304,
+                  "storage": "file",
+                  "status": "valid",
+                  "protected": false,
+                  "bytes_read": 1,
+                  "bytes_written": 2,
+                  "bytes_deduplicated": 3,
+                  "bytes_sparse": 4,
+                  "duration": 5,
+                  "labels": {
+                    "label-1": "bla",
+                    "label-2": "blub"
+                  },
+                  "blocks": [
+                    {
+                      "uid": {
+                        "left": 1,
+                        "right": 1
+                      },
+                      "idx": 0,
+                      "size": 670293,
+                      "valid": true,
+                      "checksum": "066dde4d22ebc3e72c485a6a38b9013ac8efa4e4951a9b1c301e3d6579e25564"
+                    }
+                  ]
+                },
+                {
+                  "uid": "v000000002",
+                  "date": "2018-12-19T20:28:18.123456Z",
+                  "volume": "data-backup",
+                  "snapshot": "snapshot-name",
+                  "size": 670293,
+                  "block_size": 4194304,
+                  "storage": "file",
+                  "status": "valid",
+                  "protected": false,
+                  "bytes_read": 1,
+                  "bytes_written": 2,
+                  "bytes_deduplicated": 3,
+                  "bytes_sparse": 4,
+                  "duration": 5,
+                   "labels": {
+                    "label-1": "bla",
+                    "label-2": "blub"
+                  },
+                  "blocks": [
+                    {
+                      "uid": {
+                        "left": 1,
+                        "right": 1
+                      },
+                      "idx": 0,
+                      "size": 670293,
+                      "valid": true,
+                      "checksum": "066dde4d22ebc3e72c485a6a38b9013ac8efa4e4951a9b1c301e3d6579e25564"
+                    }
+                  ]
+                },
+                {
+                  "uid": "v000000003",
+                  "date": "2018-12-19T20:28:18.123456Z",
+                  "volume": "data-backup",
+                  "snapshot": "snapshot-name",
+                  "size": 670293,
+                  "block_size": 4194304,
+                  "storage": "file",
+                  "status": "valid",
+                  "protected": false,
+                  "bytes_read": 1,
+                  "bytes_written": 2,
+                  "bytes_deduplicated": 3,
+                  "bytes_sparse": 4,
+                  "duration": 5,
+                  "labels": {
+                    "label-1": "bla",
+                    "label-2": "blub"
+                  },
+                  "blocks": [
+                    {
+                      "uid": {
+                        "left": 1,
+                        "right": 1
+                      },
+                      "idx": 0,
+                      "size": 670293,
+                      "valid": true,
+                      "checksum": "066dde4d22ebc3e72c485a6a38b9013ac8efa4e4951a9b1c301e3d6579e25564"
+                    }
+                  ]
+                }
+              ],
+              "metadata_version": "2.0.0"
             }
             """
 

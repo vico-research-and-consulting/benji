@@ -102,8 +102,12 @@ class NbdServer(ReprMixIn):
     NBD_FLAG_FIXED_NEWSTYLE = 1 << 0
     NBD_FLAG_NO_ZEROES = 1 << 1
 
-    # Our flags
-    NBD_HANDSHAKE_FLAGS = NBD_FLAG_FIXED_NEWSTYLE
+    # Contrary to the NBD specification which states:
+    #   bit 1, NBD_FLAG_NO_ZEROES; if set, and if the client replies with NBD_FLAG_C_NO_ZEROES in the client flags
+    #   field, the server MUST NOT send the 124 bytes of zero at the end of the negotiation.
+    # at least nbd-client 3.19 will assume NBD_FLAG_NO_ZEROES even when the server doesn't advertise it.
+    # This has been fixed in nbd-client via https://github.com/NetworkBlockDevice/nbd/commit/d5b2a76775803ea7d6378a8e9caa58d756b30940.
+    NBD_HANDSHAKE_FLAGS = NBD_FLAG_FIXED_NEWSTYLE | NBD_FLAG_NO_ZEROES
 
     # Export flags
     NBD_FLAG_HAS_FLAGS = (1 << 0)
@@ -180,7 +184,11 @@ class NbdServer(ReprMixIn):
             if not fixed:
                 self.log.warning("Client did not signal fixed new-style handshake.")
 
-            client_flags ^= self.NBD_FLAG_FIXED_NEWSTYLE
+            no_zeros = (client_flags & self.NBD_FLAG_NO_ZEROES) != 0
+            if no_zeros:
+                self.log.debug("Client requested NBD_FLAG_NO_ZEROES.")
+
+            client_flags ^= self.NBD_FLAG_FIXED_NEWSTYLE | self.NBD_FLAG_NO_ZEROES
             if client_flags > 0:
                 raise IOError("Handshake failed, unknown client flags %s, disconnecting." % (client_flags))
 
@@ -202,7 +210,7 @@ class NbdServer(ReprMixIn):
                 else:
                     data = None
 
-                self.log.debug("[%s:%s]: opt=%s, length=%s, data=%s" % (host, port, opt, length, data))
+                self.log.debug("[%s:%s]: opt=%s, length=%s, data=%r" % (host, port, opt, length, data))
 
                 if opt == self.NBD_OPT_EXPORTNAME:
                     if not data:
@@ -217,7 +225,7 @@ class NbdServer(ReprMixIn):
                         yield from writer.drain()
                         continue
 
-                    self.log.info("[%s:%s] Negotiated export: %s." % (host, port, version_uid.v_string))
+                    self.log.info("[%s:%s] Negotiated export: %s." % (host, port, version_uid))
 
                     # We have negotiated a version and it will be used until the client disconnects
                     version = self.store.get_versions(version_uid=version_uid)[0]
@@ -236,7 +244,8 @@ class NbdServer(ReprMixIn):
                     # size of 4096
                     size = math.ceil(version.size / 4096) * 4096
                     writer.write(struct.pack('>QH', size, export_flags))
-                    writer.write(b"\x00" * 124)
+                    if not no_zeros:
+                        writer.write(b"\x00" * 124)
                     yield from writer.drain()
 
                     # Transition to transmission phase
@@ -245,7 +254,7 @@ class NbdServer(ReprMixIn):
                 elif opt == self.NBD_OPT_LIST:
                     # Don't use version as a loop variable so we don't conflict with the outer scope usage
                     for list_version in self.store.get_versions():
-                        list_version_encoded = list_version.uid.v_string.encode("ascii")
+                        list_version_encoded = list_version.uid.encode("ascii")
                         writer.write(
                             struct.pack(">QLLL", self.NBD_OPT_REPLY_MAGIC, opt, self.NBD_REP_SERVER,
                                         len(list_version_encoded) + 4))
@@ -262,7 +271,11 @@ class NbdServer(ReprMixIn):
 
                     raise _NbdServerAbortedNegotiationError()
                 else:
-                    # We don't support any other option
+                    # We don't support any other option.
+                    # nbd-client will always try NBD_OPT_GO before NBD_OPT_EXPORTNAME so we don't log it.
+                    if opt != self.NBD_OPT_GO:
+                        self.log.warning("[%s:%s] Received unsupported option: %s." % (host, port, opt))
+
                     if not fixed:
                         raise IOError("Unsupported option: %s." % (opt))
 
@@ -283,8 +296,8 @@ class NbdServer(ReprMixIn):
                 cmd_flags = cmd & self.NBD_CMD_MASK_FLAGS
                 cmd = cmd & self.NBD_CMD_MASK_COMMAND
 
-                self.log.debug(
-                    "[%s:%s]: cmd=%s, cmd_flags=%s, handle=%s, offset=%s, len=%s" % (host, port, cmd, cmd_flags, handle, offset, length))
+                self.log.debug("[%s:%s]: cmd=%s, cmd_flags=%s, handle=%s, offset=%s, len=%s" %
+                               (host, port, cmd, cmd_flags, handle, offset, length))
 
                 # We don't support any command flags
                 if cmd_flags != 0:
@@ -309,8 +322,8 @@ class NbdServer(ReprMixIn):
                     try:
                         self.store.write(cow_version, offset, data)
                     except Exception as exception:
-                        self.log.error(
-                            "[%s:%s] NBD_CMD_WRITE: %s\n%s." % (host, port, exception, traceback.format_exc()))
+                        self.log.error("[%s:%s] NBD_CMD_WRITE: %s\n%s." %
+                                       (host, port, exception, traceback.format_exc()))
                         yield from self.nbd_response(writer, handle, error=self.EIO)
                         continue
 
@@ -335,8 +348,8 @@ class NbdServer(ReprMixIn):
                     try:
                         self.store.flush(cow_version)
                     except Exception as exception:
-                        self.log.error(
-                            "[%s:%s] NBD_CMD_FLUSH: %s\n%s." % (host, port, exception, traceback.format_exc()))
+                        self.log.error("[%s:%s] NBD_CMD_FLUSH: %s\n%s." %
+                                       (host, port, exception, traceback.format_exc()))
                         yield from self.nbd_response(writer, handle, error=self.EIO)
                         continue
 

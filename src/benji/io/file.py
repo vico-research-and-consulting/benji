@@ -17,8 +17,11 @@ class IO(IOBase):
 
     def __init__(self, *, config: Config, name: str, module_configuration: ConfigDict, url: str,
                  block_size: int) -> None:
-        super().__init__(
-            config=config, name=name, module_configuration=module_configuration, url=url, block_size=block_size)
+        super().__init__(config=config,
+                         name=name,
+                         module_configuration=module_configuration,
+                         url=url,
+                         block_size=block_size)
 
         if self.parsed_url.username or self.parsed_url.password or self.parsed_url.hostname or self.parsed_url.port \
                 or self.parsed_url.params or self.parsed_url.fragment or self.parsed_url.query:
@@ -37,8 +40,7 @@ class IO(IOBase):
 
         if os.path.exists(self.parsed_url.path):
             if not force:
-                raise FileExistsError('{} already exists. Force the restore if you want to overwrite it.'.format(
-                    self.url))
+                raise FileExistsError('{} already exists. Force the restore if you want to overwrite it.'.format(self.url))
             else:
                 if size > self.size():
                     raise IOError('{} is too small. Its size is {} bytes, but we need {} bytes for the restore.'.format(
@@ -61,7 +63,7 @@ class IO(IOBase):
         return size
 
     def _read(self, block: DereferencedBlock) -> Tuple[DereferencedBlock, bytes]:
-        offset = block.id * self.block_size
+        offset = block.idx * self.block_size
         t1 = time.time()
         with open(self.parsed_url.path, 'rb') as f:
             f.seek(offset)
@@ -74,14 +76,17 @@ class IO(IOBase):
 
         logger.debug('{} read block {} in {:.3f}s'.format(
             threading.current_thread().name,
-            block.id,
+            block.idx,
             t2 - t1,
-            ))
+        ))
 
         return block, data
 
     def read(self, block: Union[DereferencedBlock, Block]) -> None:
-        block_deref = block.deref() if isinstance(block, Block) else block
+        # We do need to dereference the block outside of the closure otherwise a reference to the block will be held
+        # inside of the closure leading to database troubles.
+        # See https://github.com/elemental-lf/benji/issues/61.
+        block_deref = block.deref()
 
         def job():
             return self._read(block_deref)
@@ -90,16 +95,15 @@ class IO(IOBase):
         self._read_executor.submit(job)
 
     def read_sync(self, block: Union[DereferencedBlock, Block]) -> bytes:
-        block_deref = block.deref() if isinstance(block, Block) else block
-        return self._read(block_deref)[1]
+        return self._read(block.deref())[1]
 
-    def read_get_completed(
-            self, timeout: Optional[int] = None) -> Iterator[Union[Tuple[DereferencedBlock, bytes], BaseException]]:
+    def read_get_completed(self, timeout: Optional[int] = None
+                          ) -> Iterator[Union[Tuple[DereferencedBlock, bytes], BaseException]]:
         assert self._read_executor is not None
         return self._read_executor.get_completed(timeout=timeout)
 
     def _write(self, block: DereferencedBlock, data: bytes) -> DereferencedBlock:
-        offset = block.id * self.block_size
+        offset = block.idx * self.block_size
         t1 = time.time()
         with open(self.parsed_url.path, 'rb+') as f:
             f.seek(offset)
@@ -109,23 +113,27 @@ class IO(IOBase):
 
         logger.debug('{} wrote block {} in {:.3f}s'.format(
             threading.current_thread().name,
-            block.id,
+            block.idx,
             t2 - t1,
-            ))
+        ))
 
         assert written == len(data)
         return block
 
-    def write(self, block: DereferencedBlock, data: bytes) -> None:
+    def write(self, block: Union[DereferencedBlock, Block], data: bytes) -> None:
+        # We do need to dereference the block outside of the closure otherwise a reference to the block will be held
+        # inside of the closure leading to database troubles.
+        # See https://github.com/elemental-lf/benji/issues/61.
+        block_deref = block.deref()
 
         def job():
-            return self._write(block, data)
+            return self._write(block_deref, data)
 
         assert self._write_executor is not None
         self._write_executor.submit(job)
 
-    def write_sync(self, block: DereferencedBlock, data: bytes) -> None:
-        self._write(block, data)
+    def write_sync(self, block: Union[DereferencedBlock, Block], data: bytes) -> None:
+        self._write(block.deref(), data)
 
     def write_get_completed(self, timeout: Optional[int] = None) -> Iterator[Union[DereferencedBlock, BaseException]]:
         assert self._write_executor is not None

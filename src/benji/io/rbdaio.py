@@ -132,6 +132,7 @@ class IO(IOBase):
         return self._rbd_image.size()
 
     def _submit_aio_reads(self):
+        assert self._rbd_image is not None
         while len(self._read_queue) > 0 and self._outstanding_aio_reads < self._simultaneous_reads:
             block = self._read_queue.pop()
             t1 = time.time()
@@ -140,18 +141,17 @@ class IO(IOBase):
                 t2 = time.time()
                 self._read_completion_queue.put((completion, t1, t2, block, data))
 
-            offset = block.id * self.block_size
+            offset = block.idx * self.block_size
             self._rbd_image.aio_read(offset, block.size, aio_callback, rados.LIBRADOS_OP_FLAG_FADVISE_DONTNEED)
             self._outstanding_aio_reads += 1
 
     def read(self, block: Union[DereferencedBlock, Block]) -> None:
-        block_deref = block.deref() if isinstance(block, Block) else block
-        self._read_queue.appendleft(block_deref)
+        self._read_queue.appendleft(block.deref())
         self._submit_aio_reads()
 
     def read_sync(self, block: Union[DereferencedBlock, Block]) -> bytes:
         assert self._rbd_image is not None
-        offset = block.id * self.block_size
+        offset = block.idx * self.block_size
         t1 = time.time()
         data = self._rbd_image.read(offset, block.size, rados.LIBRADOS_OP_FLAG_FADVISE_DONTNEED)
         t2 = time.time()
@@ -159,7 +159,7 @@ class IO(IOBase):
         if not data:
             raise EOFError('End of file reached on {} when there should be data.'.format(self.url))
 
-        logger.debug('Read block {} in {:.3f}s'.format(block.id, t2 - t1))
+        logger.debug('Read block {} in {:.3f}s'.format(block.idx, t2 - t1))
 
         return data
 
@@ -187,18 +187,18 @@ class IO(IOBase):
                     read_return_value = completion.get_return_value()
 
                     if read_return_value < 0:
-                        raise IOError('Read of block {} failed.'.format(block.id))
+                        raise IOError('Read of block {} failed.'.format(block.idx))
 
                     if read_return_value != block.size:
                         raise IOError('Short read of block {}. Wanted {} bytes but got {}.'.format(
-                            block.id, block.size, read_return_value))
+                            block.idx, block.size, read_return_value))
 
                     if not data:
                         # We shouldn't get here because a failed read should be caught by the "read_return_value < 0"
                         # check above. See: https://github.com/ceph/ceph/blob/880468b4bf6f0a1995de5bd98c09007a00222cbf/src/pybind/rbd/rbd.pyx#L4145.
-                        raise IOError('Read of block {} failed.'.format(block.id))
+                        raise IOError('Read of block {} failed.'.format(block.idx))
 
-                    logger.debug('Read block {} in {:.3f}s'.format(block.id, t2 - t1))
+                    logger.debug('Read block {} in {:.3f}s'.format(block.idx, t2 - t1))
 
                     yield block, data
 
@@ -220,22 +220,23 @@ class IO(IOBase):
                 self._submitted_aio_writes.release()
 
             self._submitted_aio_writes.acquire()
-            offset = block.id * self.block_size
+            offset = block.idx * self.block_size
             self._rbd_image.aio_write(data, offset, aio_callback, rados.LIBRADOS_OP_FLAG_FADVISE_DONTNEED)
             self._outstanding_aio_writes += 1
 
-    def write(self, block: DereferencedBlock, data: bytes) -> None:
-        self._write_queue.appendleft((block, data))
+    def write(self, block: Union[DereferencedBlock, Block], data: bytes) -> None:
+        assert self._rbd_image is not None
+        self._write_queue.appendleft((block.deref(), data))
         self._submit_aio_writes()
 
-    def write_sync(self, block: DereferencedBlock, data: bytes) -> None:
+    def write_sync(self, block: Union[DereferencedBlock, Block], data: bytes) -> None:
         assert self._rbd_image is not None
-        offset = block.id * self.block_size
+        offset = block.idx * self.block_size
         t1 = time.time()
         written = self._rbd_image.write(data, offset, rados.LIBRADOS_OP_FLAG_FADVISE_DONTNEED)
         t2 = time.time()
 
-        logger.debug('Wrote block {} in {:.3f}s'.format(block.id, t2 - t1))
+        logger.debug('Wrote block {} in {:.3f}s'.format(block.idx, t2 - t1))
 
         assert written == block.size
 
@@ -261,9 +262,9 @@ class IO(IOBase):
                 else:
                     write_return_value = completion.get_return_value()
                     if write_return_value != 0:
-                        raise IOError('Write of block {} failed.'.format(block.id))
+                        raise IOError('Write of block {} failed.'.format(block.idx))
 
-                    logger.debug('Wrote block {} in {:.3f}s'.format(block.id, t2 - t1))
+                    logger.debug('Wrote block {} in {:.3f}s'.format(block.idx, t2 - t1))
 
                     yield block
 

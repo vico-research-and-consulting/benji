@@ -10,6 +10,8 @@ from abc import ABCMeta, abstractmethod
 from typing import Union, Optional, Dict, Tuple, List, Sequence, cast, Iterator, Iterable
 
 import semantic_version
+from diskcache import FanoutCache
+
 from benji.config import Config, ConfigDict
 from benji.database import VersionUid, DereferencedBlock, BlockUid, Block
 from benji.exception import ConfigurationError, BenjiException
@@ -21,7 +23,6 @@ from benji.storage.dicthmac import DictHMAC
 from benji.transform.base import TransformBase
 from benji.utils import TokenBucket, derive_key
 from benji.versions import VERSIONS
-from diskcache import FanoutCache
 
 
 class InvalidBlockException(BenjiException, IOError):
@@ -61,9 +62,8 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
 
     _META_SUFFIX = '.meta'
 
-    def __init__(self, *, config: Config, name: str, storage_id: int, module_configuration: ConfigDict) -> None:
+    def __init__(self, *, config: Config, name: str, module_configuration: ConfigDict) -> None:
         self._name = name
-        self._storage_id = storage_id
         self._active_transforms: List[TransformBase] = []
 
         active_transforms = Config.get_from_dict(module_configuration, 'activeTransforms', None, types=list)
@@ -116,10 +116,6 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
     def name(self) -> str:
         return self._name
 
-    @property
-    def storage_id(self) -> int:
-        return self._storage_id
-
     def _build_metadata(self,
                         *,
                         size: int,
@@ -127,7 +123,7 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
                         transforms_metadata: List[Dict] = None,
                         checksum: str = None) -> Tuple[Dict, bytes]:
 
-        timestamp = datetime.datetime.utcnow().isoformat(timespec='microseconds')
+        timestamp = datetime.datetime.utcnow().isoformat(timespec='microseconds') + 'Z'
         metadata: Dict = {
             self._CREATED_KEY: timestamp,
             self._METADATA_VERSION_KEY: str(VERSIONS.object_metadata.current),
@@ -213,13 +209,16 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
             try:
                 self._check_write(key=key, metadata_key=metadata_key, data_expected=data)
             except (KeyError, ValueError) as exception:
-                raise InvalidBlockException('Check write of block {} (UID {}) failed.'.format(block.id, block.uid),
+                raise InvalidBlockException('Check write of block {} (UID {}) failed.'.format(block.idx, block.uid),
                                             block) from exception
 
         return block
 
     def write_block_async(self, block: Union[DereferencedBlock, Block], data: bytes) -> None:
-        block_deref = block.deref() if isinstance(block, Block) else block
+        # We do need to dereference the block outside of the closure otherwise a reference to the block will be held
+        # inside of the closure leading to database troubles.
+        # See https://github.com/elemental-lf/benji/issues/61.
+        block_deref = block.deref()
 
         def job():
             return self._write(block_deref, data)
@@ -227,8 +226,7 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
         self._write_executor.submit(job)
 
     def write_block(self, block: Union[DereferencedBlock, Block], data: bytes) -> None:
-        block_deref = block.deref() if isinstance(block, Block) else block
-        self._write(block_deref, data)
+        self._write(block.deref(), data)
 
     def write_get_completed(self, timeout: int = None) -> Iterator[Union[DereferencedBlock, BaseException]]:
         return self._write_executor.get_completed(timeout=timeout)
@@ -249,19 +247,19 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
             t2 = time.time()
         except FileNotFoundError as exception:
             raise InvalidBlockException(
-                'Object metadata or data of block {} (UID{}) not found.'.format(block.id, block.uid),
+                'Object metadata or data of block {} (UID{}) not found.'.format(block.idx, block.uid),
                 block) from exception
 
         try:
             metadata = self._decode_metadata(metadata_json=metadata_json, key=key, data_length=data_length)
         except (KeyError, ValueError) as exception:
-            raise InvalidBlockException('Object metadata of block {} (UID{}) is invalid.'.format(block.id, block.uid),
+            raise InvalidBlockException('Object metadata of block {} (UID{}) is invalid.'.format(block.idx, block.uid),
                                         block) from exception
 
         if self._CHECKSUM_KEY not in metadata:
             raise InvalidBlockException(
                 'Required object metadata key {} is missing for block {} (UID {}).'.format(
-                    self._CHECKSUM_KEY, block.id, block.uid), block)
+                    self._CHECKSUM_KEY, block.idx, block.uid), block)
 
         if not metadata_only and self._TRANSFORMS_KEY in metadata:
             data = self._decapsulate(data, metadata[self._TRANSFORMS_KEY])  # type: ignore
@@ -272,9 +270,13 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
         return block, data, metadata
 
     def read_block_async(self, block: Block, metadata_only: bool = False) -> None:
+        # We do need to dereference the block outside of the closure otherwise a reference to the block will be held
+        # inside of the closure leading to database troubles.
+        # See https://github.com/elemental-lf/benji/issues/61.
+        block_deref = block.deref()
 
         def job():
-            return self._read(block.deref(), metadata_only)
+            return self._read(block_deref, metadata_only)
 
         self._read_executor.submit(job)
 
@@ -289,16 +291,16 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
         # Existence of keys has already been checked in _decode_metadata() and _read()
         if metadata[self._SIZE_KEY] != block.size:
             raise ValueError('Mismatch between recorded block size and data length in object metadata for block {} (UID {}). '
-                             'Expected: {}, got: {}.'.format(block.id, block.uid, block.size, metadata[self._SIZE_KEY]))
+                             'Expected: {}, got: {}.'.format(block.idx, block.uid, block.size, metadata[self._SIZE_KEY]))
 
         if data_length and data_length != block.size:
             raise ValueError('Mismatch between recorded block size and actual data length for block {} (UID {}). '
-                             'Expected: {}, got: {}.'.format(block.id, block.uid, block.size, data_length))
+                             'Expected: {}, got: {}.'.format(block.idx, block.uid, block.size, data_length))
 
         if block.checksum != metadata[self._CHECKSUM_KEY]:
             raise ValueError('Mismatch between recorded block checksum and checksum in object metadata for block {} (UID {}). '
                              'Expected: {}, got: {}.'.format(
-                                 block.id,
+                                 block.idx,
                                  block.uid,
                                  cast(str, block.checksum)[:16],  # We know that block.checksum is set
                                  metadata[self._CHECKSUM_KEY][:16]))
@@ -309,7 +311,7 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
         try:
             self._rm_object(key)
         except FileNotFoundError as exception:
-            raise BlockNotFoundError('Block UID {} not found on storage.'.format(str(uid)), uid) from exception
+            raise BlockNotFoundError('Block UID {} not found on storage.'.format(uid), uid) from exception
         finally:
             try:
                 self._rm_object(metadata_key)
@@ -392,7 +394,7 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
             except FileNotFoundError:
                 pass
             else:
-                raise FileExistsError('Version {} already exists in storage.'.format(version_uid.v_string))
+                raise FileExistsError('Version {} already exists in storage.'.format(version_uid))
 
         data_bytes = data.encode('utf-8')
         size = len(data_bytes)
@@ -501,7 +503,7 @@ class StorageBase(ReprMixIn, metaclass=ABCMeta):
 
 class ReadCacheStorageBase(StorageBase):
 
-    def __init__(self, *, config: Config, name: str, storage_id: int, module_configuration: ConfigDict) -> None:
+    def __init__(self, *, config: Config, name: str, module_configuration: ConfigDict) -> None:
         read_cache_directory = Config.get_from_dict(module_configuration, 'readCache.directory', None, types=str)
         read_cache_maximum_size = Config.get_from_dict(module_configuration, 'readCache.maximumSize', None, types=int)
         read_cache_shards = Config.get_from_dict(module_configuration, 'readCache.shards', None, types=int)
@@ -527,7 +529,7 @@ class ReadCacheStorageBase(StorageBase):
         self._use_read_cache = True
 
         # Start reader and write threads after the disk cached is created, so that they see it.
-        super().__init__(config=config, name=name, storage_id=storage_id, module_configuration=module_configuration)
+        super().__init__(config=config, name=name, module_configuration=module_configuration)
 
     def _read(self, block: DereferencedBlock, metadata_only: bool) -> Tuple[DereferencedBlock, Optional[bytes], Dict]:
         key = block.uid.storage_object_to_path()

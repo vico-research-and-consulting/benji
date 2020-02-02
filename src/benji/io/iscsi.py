@@ -5,6 +5,7 @@ import time
 from typing import Tuple, Optional, Callable, Any, List, Union, Iterator
 
 import libiscsi.libiscsi as libiscsi
+
 from benji.config import ConfigDict, Config
 from benji.database import DereferencedBlock, Block
 from benji.exception import ConfigurationError, UsageError
@@ -20,8 +21,11 @@ class IO(IOBase):
 
     def __init__(self, *, config: Config, name: str, module_configuration: ConfigDict, url: str,
                  block_size: int) -> None:
-        super().__init__(
-            config=config, name=name, module_configuration=module_configuration, url=url, block_size=block_size)
+        super().__init__(config=config,
+                         name=name,
+                         module_configuration=module_configuration,
+                         url=url,
+                         block_size=block_size)
 
         if self.parsed_url.params or self.parsed_url.fragment:
             raise UsageError('The supplied URL {} is invalid.'.format(self.url))
@@ -109,9 +113,8 @@ class IO(IOBase):
                 self.block_size, self._iscsi_block_size))
 
         if self.block_size % self._iscsi_block_size != 0:
-            raise RuntimeError(
-                'Block size of version is not aligned to block size of iSCSI target (remainder {}).'.format(
-                    self.block_size % self._iscsi_block_size))
+            raise RuntimeError('Block size of version is not aligned to block size of iSCSI target (remainder {}).'.format(
+                self.block_size % self._iscsi_block_size))
 
         self._iscsi_context = iscsi_context
 
@@ -126,11 +129,11 @@ class IO(IOBase):
 
     def close(self) -> None:
         if len(self._read_queue) > 0:
-            logger.warning('Closing IO module with {} read outstanding jobs.'.format(self._name, len(self._read_queue)))
+            logger.warning('Closing IO module with {} outstanding read jobs.'.format(len(self._read_queue)))
             self._read_queue = []
 
         if self._outstanding_write is not None:
-            logger.warning('Closing IO module with one outstanding write.'.format(self._name))
+            logger.warning('Closing IO module with one outstanding write.')
             self._outstanding_write = None
 
         self._iscsi_context = None
@@ -141,7 +144,7 @@ class IO(IOBase):
 
     def _read(self, block: DereferencedBlock) -> Tuple[DereferencedBlock, bytes]:
         assert block.size == self.block_size
-        lba = (block.id * self.block_size) // self._iscsi_block_size
+        lba = (block.idx * self.block_size) // self._iscsi_block_size
         num_blocks = self.block_size // self._iscsi_block_size
 
         if lba >= self._iscsi_num_blocks:
@@ -164,28 +167,26 @@ class IO(IOBase):
 
         logger.debug('{} read block {} in {:.3f}s'.format(
             threading.current_thread().name,
-            block.id,
+            block.idx,
             t2 - t1,
         ))
 
         return block, data
 
     def read(self, block: Union[DereferencedBlock, Block]) -> None:
-        block_deref = block.deref() if isinstance(block, Block) else block
-        self._read_queue.append(block_deref)
+        self._read_queue.append(block.deref())
 
     def read_sync(self, block: Union[DereferencedBlock, Block]) -> bytes:
-        block_deref = block.deref() if isinstance(block, Block) else block
-        return self._read(block_deref)[1]
+        return self._read(block.deref())[1]
 
-    def read_get_completed(
-            self, timeout: Optional[int] = None) -> Iterator[Union[Tuple[DereferencedBlock, bytes], BaseException]]:
+    def read_get_completed(self, timeout: Optional[int] = None
+                          ) -> Iterator[Union[Tuple[DereferencedBlock, bytes], BaseException]]:
         while len(self._read_queue) > 0:
             yield self._read(self._read_queue.pop())
 
     def _write(self, block: DereferencedBlock, data: bytes) -> DereferencedBlock:
         assert block.size == self.block_size
-        lba = (block.id * self.block_size) // self._iscsi_block_size
+        lba = (block.idx * self.block_size) // self._iscsi_block_size
         num_blocks = self.block_size // self._iscsi_block_size
 
         if lba >= self._iscsi_num_blocks:
@@ -205,21 +206,20 @@ class IO(IOBase):
 
         logger.debug('{} wrote block {} in {:.3f}s'.format(
             threading.current_thread().name,
-            block.id,
+            block.idx,
             t2 - t1,
         ))
 
         return block
 
-    def write(self, block: DereferencedBlock, data: bytes) -> None:
+    def write(self, block: Union[DereferencedBlock, Block], data: bytes) -> None:
         assert self._outstanding_write is None
-        self._outstanding_write = (block, data)
+        self._outstanding_write = (block.deref(), data)
 
-    def write_sync(self, block: DereferencedBlock, data: bytes) -> None:
-        self._write(block, data)
+    def write_sync(self, block: Union[DereferencedBlock, Block], data: bytes) -> None:
+        self._write(block.deref(), data)
 
     def write_get_completed(self, timeout: Optional[int] = None) -> Iterator[Union[DereferencedBlock, BaseException]]:
         if self._outstanding_write is not None:
             yield self._write(*self._outstanding_write)
             self._outstanding_write = None
-

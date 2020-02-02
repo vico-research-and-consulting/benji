@@ -1,11 +1,11 @@
 import datetime
+import math
 import time
 import timeit
 import uuid
 from typing import List, Dict, Any
 from unittest import TestCase
 
-import sqlalchemy
 from dateutil import tz
 
 from benji.database import BlockUid, VersionUid, VersionStatus
@@ -17,17 +17,18 @@ from benji.tests.testcase import DatabaseBackendTestCaseBase
 class DatabaseBackendTestCase(DatabaseBackendTestCaseBase):
 
     def test_version(self):
-        version = self.database_backend.create_version(
-            version_name='backup-name',
-            snapshot_name='snapshot-name',
-            size=16 * 1024 * 4096,
-            storage_id=1,
-            block_size=4 * 1024 * 4096)
+        self.database_backend.sync_storage('s-1', storage_id=1)
+        version = self.database_backend.create_version(version_uid=VersionUid('v1'),
+                                                       volume='backup-name',
+                                                       snapshot='snapshot-name',
+                                                       size=16 * 1024 * 4096,
+                                                       storage_id=1,
+                                                       block_size=4 * 1024 * 4096)
         self.database_backend.commit()
 
         version = self.database_backend.get_version(version.uid)
-        self.assertEqual('backup-name', version.name)
-        self.assertEqual('snapshot-name', version.snapshot_name)
+        self.assertEqual('backup-name', version.volume)
+        self.assertEqual('snapshot-name', version.snapshot)
         self.assertEqual(16 * 1024 * 4096, version.size)
         self.assertEqual(4 * 1024 * 4096, version.block_size)
         self.assertEqual(version.status, VersionStatus.incomplete)
@@ -53,18 +54,18 @@ class DatabaseBackendTestCase(DatabaseBackendTestCaseBase):
         self.database_backend.add_label(version.uid, 'label-2', '')
         version = self.database_backend.get_version(version.uid)
         self.assertEqual(2, len(version.labels))
-        self.assertEqual(version.uid, version.labels[0].version_uid)
-        self.assertEqual('label-1', version.labels[0].name)
-        self.assertEqual('bla', version.labels[0].value)
-        self.assertEqual(version.uid, version.labels[1].version_uid)
-        self.assertEqual('label-2', version.labels[1].name)
-        self.assertEqual('', version.labels[1].value)
+        self.assertEqual(version.id, version.labels['label-1'].version_id)
+        self.assertEqual('label-1', version.labels['label-1'].name)
+        self.assertEqual('bla', version.labels['label-1'].value)
+        self.assertEqual(version.id, version.labels['label-2'].version_id)
+        self.assertEqual('label-2', version.labels['label-2'].name)
+        self.assertEqual('', version.labels['label-2'].value)
 
         self.database_backend.add_label(version.uid, 'label-2', 'test123')
         version = self.database_backend.get_version(version.uid)
-        self.assertEqual(version.uid, version.labels[1].version_uid)
-        self.assertEqual('label-2', version.labels[1].name)
-        self.assertEqual('test123', version.labels[1].value)
+        self.assertEqual(version.id, version.labels['label-2'].version_id)
+        self.assertEqual('label-2', version.labels['label-2'].name)
+        self.assertEqual('test123', version.labels['label-2'].value)
 
         self.database_backend.rm_label(version.uid, 'label-1')
         version = self.database_backend.get_version(version.uid)
@@ -78,105 +79,86 @@ class DatabaseBackendTestCase(DatabaseBackendTestCaseBase):
         version = self.database_backend.get_version(version.uid)
         self.assertEqual(0, len(version.labels))
 
-        version_uids = set()
-        for _ in range(256):
-            version = self.database_backend.create_version(
-                version_name='backup-name',
-                snapshot_name='snapshot-name',
-                size=16 * 1024 * 4096,
-                storage_id=1,
-                block_size=4 * 1024 * 4096)
-            version = self.database_backend.get_version(version.uid)
-            self.assertNotIn(version.uid, version_uids)
-            version_uids.add(version.uid)
-
     def test_block(self):
-        version = self.database_backend.create_version(
-            version_name='name-' + self.random_string(12),
-            snapshot_name='snapshot-name-' + self.random_string(12),
-            size=256 * 1024 * 4096,
-            block_size=1024 * 4096,
-            storage_id=1)
+        self.database_backend.sync_storage('s-1', storage_id=1)
+        version = self.database_backend.create_version(version_uid=VersionUid('v1'),
+                                                       volume='name-' + self.random_string(12),
+                                                       snapshot='snapshot-name-' + self.random_string(12),
+                                                       size=256 * 1024 * 4096,
+                                                       block_size=1024 * 4096,
+                                                       storage_id=1)
 
         checksums = []
         uids = []
         num_blocks = 256
         blocks: List[Dict[str, Any]] = []
-        for id in range(num_blocks):
+        for idx in range(num_blocks):
             checksums.append(self.random_hex(64))
-            uids.append(BlockUid(1, id))
+            uids.append(BlockUid(1, idx))
             blocks.append({
-                'id': id,
-                'version_uid': version.uid,
-                'uid_left': uids[id].left,
-                'uid_right': uids[id].right,
-                'checksum': checksums[id],
+                'idx': idx,
+                'uid_left': uids[idx].left,
+                'uid_right': uids[idx].right,
+                'checksum': checksums[idx],
                 'size': 1024 * 4096,
                 'valid': True
             })
-        self.database_backend.create_blocks(blocks=blocks)
+        self.database_backend.create_blocks(version=version, blocks=blocks)
         self.database_backend.commit()
 
-        for id, checksum in enumerate(checksums):
+        for idx, checksum in enumerate(checksums):
             block = self.database_backend.get_block_by_checksum(checksum, 1)
-            self.assertEqual(id, block.id)
-            self.assertEqual(version.uid, block.version_uid)
-            self.assertEqual(uids[id], block.uid)
+            self.assertEqual(idx, block.idx)
+            self.assertEqual(version.id, block.version_id)
+            self.assertEqual(uids[idx], block.uid)
             self.assertEqual(checksum, block.checksum)
             self.assertEqual(1024 * 4096, block.size)
             self.assertTrue(block.valid)
 
-        for id, uid in enumerate(uids):
+        for idx, uid in enumerate(uids):
             block = self.database_backend.get_block(uid)
-            self.assertEqual(id, block.id)
-            self.assertEqual(version.uid, block.version_uid)
+            self.assertEqual(idx, block.idx)
+            self.assertEqual(version.id, block.version_id)
             self.assertEqual(uid, block.uid)
-            self.assertEqual(checksums[id], block.checksum)
+            self.assertEqual(checksums[idx], block.checksum)
             self.assertEqual(1024 * 4096, block.size)
             self.assertTrue(block.valid)
 
-        for id, uid in enumerate(uids):
-            block = self.database_backend.get_block_by_id(version.uid, id)
-            self.assertEqual(id, block.id)
-            self.assertEqual(version.uid, block.version_uid)
+        for idx, uid in enumerate(uids):
+            block = self.database_backend.get_block_by_idx(version, idx)
+            self.assertEqual(idx, block.idx)
+            self.assertEqual(version.id, block.version_id)
             self.assertEqual(uid, block.uid)
-            self.assertEqual(checksums[id], block.checksum)
+            self.assertEqual(checksums[idx], block.checksum)
             self.assertEqual(1024 * 4096, block.size)
             self.assertTrue(block.valid)
 
-        blocks_iter = self.database_backend.get_blocks_by_version(version.uid)
-        blocks_count = self.database_backend.get_blocks_count_by_version(version.uid)
-        sparse_blocks_count = self.database_backend.get_blocks_count_by_version(version.uid, sparse_only=True)
+        blocks_iter = self.database_backend.get_blocks_by_version(version)
         self.assertEqual(num_blocks, len(list(blocks_iter)))
-        self.assertEqual(num_blocks, blocks_count)
-        self.assertEqual(0, sparse_blocks_count)
+        self.assertEqual(num_blocks, version.blocks_count)
+        self.assertEqual(0, version.sparse_blocks_count)
 
-        blocks_iter = self.database_backend.get_blocks_by_version(version.uid)
-        for id, block in enumerate(blocks_iter):
-            self.assertEqual(id, block.id)
-            self.assertEqual(version.uid, block.version_uid)
-            self.assertEqual(uids[id], block.uid)
-            self.assertEqual(checksums[id], block.checksum)
+        blocks_iter = self.database_backend.get_blocks_by_version(version)
+        for idx, block in enumerate(blocks_iter):
+            self.assertEqual(idx, block.idx)
+            self.assertEqual(version.id, block.version_id)
+            self.assertEqual(uids[idx], block.uid)
+            self.assertEqual(checksums[idx], block.checksum)
             self.assertEqual(1024 * 4096, block.size)
             self.assertTrue(block.valid)
 
-        blocks_iter = self.database_backend.get_blocks_by_version(version.uid)
-        for id, block in enumerate(blocks_iter):
+        blocks_iter = self.database_backend.get_blocks_by_version(version)
+        for idx, block in enumerate(blocks_iter):
             dereferenced_block = block.deref()
-            self.assertEqual(id, dereferenced_block.id)
-            self.assertEqual(version.uid, dereferenced_block.version_uid)
-            self.assertEqual(uids[id].left, dereferenced_block.uid.left)
-            self.assertEqual(uids[id].right, dereferenced_block.uid.right)
-            self.assertEqual(checksums[id], dereferenced_block.checksum)
+            self.assertEqual(idx, dereferenced_block.idx)
+            self.assertEqual(version.id, dereferenced_block.version_id)
+            self.assertEqual(uids[idx].left, dereferenced_block.uid.left)
+            self.assertEqual(uids[idx].right, dereferenced_block.uid.right)
+            self.assertEqual(checksums[idx], dereferenced_block.checksum)
             self.assertEqual(1024 * 4096, dereferenced_block.size)
             self.assertTrue(dereferenced_block.valid)
 
         self.database_backend.rm_version(version.uid)
-        blocks_iter = self.database_backend.get_blocks_by_version(version.uid)
-        blocks_count = self.database_backend.get_blocks_count_by_version(version.uid)
-        self.assertEqual(0, len(list(blocks_iter)))
-        self.assertEqual(0, blocks_count)
-
         deleted_count = 0
         for uids_deleted in self.database_backend.get_delete_candidates(-1):
             for storage in uids_deleted.values():
@@ -187,9 +169,9 @@ class DatabaseBackendTestCase(DatabaseBackendTestCaseBase):
 
     def test_lock_version(self):
         locking = self.database_backend.locking()
-        locking.lock_version(VersionUid(1), reason='locking test')
-        self.assertRaises(InternalError, lambda: locking.lock_version(VersionUid(1), reason='locking test'))
-        locking.unlock_version(VersionUid(1))
+        locking.lock_version(VersionUid('v1'), reason='locking test')
+        self.assertRaises(InternalError, lambda: locking.lock_version(VersionUid('v1'), reason='locking test'))
+        locking.unlock_version(VersionUid('v1'))
 
     def test_lock_singleton(self):
         locking = self.database_backend.locking()
@@ -205,18 +187,18 @@ class DatabaseBackendTestCase(DatabaseBackendTestCaseBase):
 
     def test_is_version_locked(self):
         locking = self.database_backend.locking()
-        lock = locking.lock_version(VersionUid(1), reason='locking test')
-        self.assertTrue(locking.is_version_locked(VersionUid(1)))
-        locking.unlock_version(VersionUid(1))
-        self.assertFalse(locking.is_version_locked(VersionUid(1)))
+        lock = locking.lock_version(VersionUid('v1'), reason='locking test')
+        self.assertTrue(locking.is_version_locked(VersionUid('v1')))
+        locking.unlock_version(VersionUid('v1'))
+        self.assertFalse(locking.is_version_locked(VersionUid('v1')))
 
     def test_lock_version_context_manager(self):
         locking = self.database_backend.locking()
-        with locking.with_version_lock(VersionUid(1), reason='locking test'):
+        with locking.with_version_lock(VersionUid('v1'), reason='locking test'):
             with self.assertRaises(InternalError):
-                locking.lock_version(VersionUid(1), reason='locking test')
-        locking.lock_version(VersionUid(1), reason='locking test')
-        locking.unlock_version(VersionUid(1))
+                locking.lock_version(VersionUid('v1'), reason='locking test')
+        locking.lock_version(VersionUid('v1'), reason='locking test')
+        locking.unlock_version(VersionUid('v1'))
 
     def test_lock_context_manager(self):
         locking = self.database_backend.locking()
@@ -228,33 +210,30 @@ class DatabaseBackendTestCase(DatabaseBackendTestCaseBase):
 
     def test_lock_override(self):
         locking = self.database_backend.locking()
-        locking.lock_version(VersionUid(1), reason='locking test')
-        self.assertRaises(InternalError, lambda: locking.lock_version(VersionUid(1), reason='locking test'))
+        locking.lock_version(VersionUid('v1'), reason='locking test')
+        self.assertRaises(InternalError, lambda: locking.lock_version(VersionUid('v1'), reason='locking test'))
         old_uuid = locking._uuid
         new_uuid = uuid.uuid1().hex
         # This fakes the appearance of another instance
         locking._uuid = new_uuid
-        self.assertRaises(AlreadyLocked, lambda: locking.lock_version(VersionUid(1), reason='locking test'))
-        locking.lock_version(VersionUid(1), reason='locking test', override_lock=True)
-        self.assertRaises(InternalError, lambda: locking.lock_version(VersionUid(1), reason='locking test'))
+        self.assertRaises(AlreadyLocked, lambda: locking.lock_version(VersionUid('v1'), reason='locking test'))
+        locking.lock_version(VersionUid('v1'), reason='locking test', override_lock=True)
+        self.assertRaises(InternalError, lambda: locking.lock_version(VersionUid('v1'), reason='locking test'))
         locking._uuid = old_uuid
-        self.assertRaises(AlreadyLocked, lambda: locking.lock_version(VersionUid(1), reason='locking test'))
+        self.assertRaises(AlreadyLocked, lambda: locking.lock_version(VersionUid('v1'), reason='locking test'))
         locking._uuid = new_uuid
-        locking.unlock_version(VersionUid(1))
-
-    def test_version_uid_string(self):
-        self.assertEqual(VersionUid(1), VersionUid('V1'))
+        locking.unlock_version(VersionUid('v1'))
 
     def test_version_filter(self):
-        version_uids = set()
+        self.database_backend.sync_storage('s-1', storage_id=1)
         for i in range(256):
-            version = self.database_backend.create_version(
-                version_name='backup-name',
-                snapshot_name='snapshot-name.{}'.format(i),
-                size=16 * 1024 * 4096,
-                storage_id=1,
-                block_size=4 * 1024 * 4096,
-                status=VersionStatus.valid)
+            version = self.database_backend.create_version(version_uid=VersionUid(f'v{i + 1}'),
+                                                           volume='backup-name',
+                                                           snapshot='snapshot-name.{}'.format(i),
+                                                           size=16 * 1024 * 4096,
+                                                           storage_id=1,
+                                                           block_size=4 * 1024 * 4096,
+                                                           status=VersionStatus.valid)
             version = self.database_backend.get_version(version.uid)
             self.assertEqual(0, len(version.labels))
             self.database_backend.add_label(version.uid, 'label-key', 'label-value')
@@ -265,8 +244,6 @@ class DatabaseBackendTestCase(DatabaseBackendTestCaseBase):
                 self.assertEqual(4, len(version.labels))
             else:
                 self.assertEqual(3, len(version.labels))
-            self.assertNotIn(version.uid, version_uids)
-            version_uids.add(version.uid)
 
         versions = self.database_backend.get_versions_with_filter()
         self.assertEqual(256, len(versions))
@@ -289,8 +266,8 @@ class DatabaseBackendTestCase(DatabaseBackendTestCaseBase):
             lambda: self.database_backend.get_versions_with_filter('labels["label-key"] == "label-value" and False'))
         self.assertRaises(UsageError, lambda: self.database_backend.get_versions_with_filter('"hallo" == "hey"'))
 
-        # name is always true because it is never empty
-        versions = self.database_backend.get_versions_with_filter('name')
+        # volume is always true because it is never empty
+        versions = self.database_backend.get_versions_with_filter('volume')
         self.assertEqual(256, len(versions))
 
         versions = self.database_backend.get_versions_with_filter('status == "valid"')
@@ -307,38 +284,34 @@ class DatabaseBackendTestCase(DatabaseBackendTestCaseBase):
         versions = self.database_backend.get_versions_with_filter('labels["label-key-2"] == 9')
         self.assertEqual(1, len(versions))
 
-        versions = self.database_backend.get_versions_with_filter('snapshot_name == "snapshot-name.1"')
+        versions = self.database_backend.get_versions_with_filter('snapshot == "snapshot-name.1"')
         self.assertEqual(1, len(versions))
-        self.assertEqual(VersionUid(2), versions[0].uid)
+        self.assertEqual(VersionUid('v2'), versions[0].uid)
 
-        versions = self.database_backend.get_versions_with_filter('snapshot_name == "snapshot-name.1" and labels["label-key-2"] == 1')
+        versions = self.database_backend.get_versions_with_filter('snapshot == "snapshot-name.1" and labels["label-key-2"] == 1')
         self.assertEqual(1, len(versions))
-        self.assertEqual(VersionUid(2), versions[0].uid)
+        self.assertEqual(VersionUid('v2'), versions[0].uid)
 
-        versions = self.database_backend.get_versions_with_filter('snapshot_name == "snapshot-name.1" and labels["label-key-2"] == "2"')
+        versions = self.database_backend.get_versions_with_filter('snapshot == "snapshot-name.1" and labels["label-key-2"] == "2"')
         self.assertEqual(0, len(versions))
 
-        versions = self.database_backend.get_versions_with_filter('snapshot_name == "snapshot-name.1" or labels["label-key-2"] == 2')
+        versions = self.database_backend.get_versions_with_filter('snapshot == "snapshot-name.1" or labels["label-key-2"] == 2')
         self.assertEqual(2, len(versions))
-        self.assertSetEqual(set([VersionUid(2), VersionUid(3)]), set([version.uid for version in versions]))
+        self.assertSetEqual(set([VersionUid('v2'), VersionUid('v3')]), set([version.uid for version in versions]))
 
-        versions = self.database_backend.get_versions_with_filter('name == "backup-name" and snapshot_name == "snapshot-name.1"')
+        versions = self.database_backend.get_versions_with_filter('volume == "backup-name" and snapshot == "snapshot-name.1"')
         self.assertEqual(1, len(versions))
-        self.assertEqual(VersionUid(2), versions[0].uid)
+        self.assertEqual(VersionUid('v2'), versions[0].uid)
 
-        versions = self.database_backend.get_versions_with_filter('name == "backup-name" and (snapshot_name == "snapshot-name.1" or snapshot_name == "snapshot-name.2")')
+        versions = self.database_backend.get_versions_with_filter('volume == "backup-name" and (snapshot == "snapshot-name.1" or snapshot == "snapshot-name.2")')
         self.assertEqual(2, len(versions))
-        self.assertSetEqual(set([VersionUid(2), VersionUid(3)]), set([version.uid for version in versions]))
+        self.assertSetEqual(set([VersionUid('v2'), VersionUid('v3')]), set([version.uid for version in versions]))
 
-        versions = self.database_backend.get_versions_with_filter('uid == "V1" or uid == "V12"')
+        versions = self.database_backend.get_versions_with_filter('uid == "v1" or uid == "v12"')
         self.assertEqual(2, len(versions))
-        self.assertSetEqual(set([VersionUid(1), VersionUid(12)]), set([version.uid for version in versions]))
+        self.assertSetEqual(set([VersionUid('v1'), VersionUid('v12')]), set([version.uid for version in versions]))
 
-        versions = self.database_backend.get_versions_with_filter('uid == 1 or uid == 2')
-        self.assertEqual(2, len(versions))
-        self.assertSetEqual(set([VersionUid(1), VersionUid(2)]), set([version.uid for version in versions]))
-
-        versions = self.database_backend.get_versions_with_filter('uid == "V1" and uid == "V12"')
+        versions = self.database_backend.get_versions_with_filter('uid == "v1" and uid == "v12"')
         self.assertEqual(0, len(versions))
 
         versions = self.database_backend.get_versions_with_filter('not labels["not-exists"]')
@@ -347,60 +320,63 @@ class DatabaseBackendTestCase(DatabaseBackendTestCaseBase):
         versions = self.database_backend.get_versions_with_filter('labels["label-key-4"]')
         self.assertEqual(128, len(versions))
 
-        versions = self.database_backend.get_versions_with_filter('labels["label-key-4"] and name')
+        versions = self.database_backend.get_versions_with_filter('labels["label-key-4"] and volume')
         self.assertEqual(128, len(versions))
 
     # Issue https://github.com/elemental-lf/benji/issues/9
     def test_version_filter_issue_9(self):
+        self.database_backend.sync_storage('s-1', storage_id=1)
         version_uids = set()
         for i in range(3):
-            version = self.database_backend.create_version(
-                version_name='backup-name',
-                snapshot_name='snapshot-name.{}'.format(i),
-                size=16 * 1024 * 4096,
-                storage_id=1,
-                block_size=4 * 1024 * 4096,
-                status=VersionStatus.valid)
+            version = self.database_backend.create_version(version_uid=VersionUid(f'v{i + 1}'),
+                                                           volume='backup-name',
+                                                           snapshot='snapshot-name.{}'.format(i),
+                                                           size=16 * 1024 * 4096,
+                                                           storage_id=1,
+                                                           block_size=4 * 1024 * 4096,
+                                                           status=VersionStatus.valid)
             self.assertNotIn(version.uid, version_uids)
             version_uids.add(version.uid)
 
-        versions = self.database_backend.get_versions_with_filter('snapshot_name == "snapshot-name.2" and name == "backup-name" and status == "valid"')
+        versions = self.database_backend.get_versions_with_filter('snapshot == "snapshot-name.2" and volume == "backup-name" and status == "valid"')
         self.assertEqual(1, len(versions))
 
-        versions = self.database_backend.get_versions_with_filter('snapshot_name == "snapshot-name.2" or name == "backup-name" or status == "valid"')
+        versions = self.database_backend.get_versions_with_filter('snapshot == "snapshot-name.2" or volume == "backup-name" or status == "valid"')
         self.assertEqual(3, len(versions))
 
     # Issue https://github.com/elemental-lf/benji/issues/9 (slowness part)
     def test_version_filter_issue_9_slowness(self):
+        self.database_backend.sync_storage('s-1', storage_id=1)
         version_uids = set()
         for i in range(3):
-            version = self.database_backend.create_version(
-                version_name='backup-name',
-                snapshot_name='snapshot-name.{}'.format(i),
-                size=16 * 1024 * 4096,
-                storage_id=1,
-                block_size=4 * 1024 * 4096)
+            version = self.database_backend.create_version(version_uid=VersionUid(f'v{i + 1}'),
+                                                           volume='backup-name',
+                                                           snapshot='snapshot-name.{}'.format(i),
+                                                           size=16 * 1024 * 4096,
+                                                           storage_id=1,
+                                                           block_size=4 * 1024 * 4096)
             self.assertNotIn(version.uid, version_uids)
             version_uids.add(version.uid)
 
         t1 = timeit.timeit(
-            lambda: self.database_backend.get_versions_with_filter('snapshot_name == "snapshot-name.2" and name == "backup-name"'),
+            lambda: self.database_backend.get_versions_with_filter('snapshot == "snapshot-name.2" and volume == "backup-name"'),
             number=1)
         t2 = timeit.timeit(
-            lambda: self.database_backend.get_versions_with_filter('(snapshot_name == "snapshot-name.2" and name == "backup-name")'),
+            lambda: self.database_backend.get_versions_with_filter('(snapshot == "snapshot-name.2" and volume == "backup-name")'),
             number=1)
         logger.debug('test_version_filter_issue_9_slowness: t1 {}, t2 {}'.format(t1, t2))
         self.assertLess(t1 - t2, 5)
 
     def test_version_filter_dateparse(self):
+        self.database_backend.sync_storage('s-1', storage_id=1)
         version_uids = set()
         for i in range(3):
-            version = self.database_backend.create_version(
-                version_name='backup-name',
-                snapshot_name='snapshot-name.{}'.format(i),
-                size=16 * 1024 * 4096,
-                storage_id=1,
-                block_size=4 * 1024 * 4096)
+            version = self.database_backend.create_version(version_uid=VersionUid(f'v{i + 1}'),
+                                                           volume='backup-name',
+                                                           snapshot='snapshot-name.{}'.format(i),
+                                                           size=16 * 1024 * 4096,
+                                                           storage_id=1,
+                                                           block_size=4 * 1024 * 4096)
             self.assertNotIn(version.uid, version_uids)
             version_uids.add(version.uid)
 
@@ -434,6 +410,53 @@ class DatabaseBackendTestCase(DatabaseBackendTestCaseBase):
         versions = self.database_backend.get_versions_with_filter('date <= "{}"'.format(
             datetime.datetime.now(tz=tz.tzlocal()).strftime("%Y-%m-%dT%H:%M:%S")))
         self.assertEqual(3, len(versions))
+
+    def test_set_block_invalid(self):
+        self.database_backend.sync_storage('s-1', storage_id=1)
+        versions = []
+        good_uid = BlockUid(1, 2)
+        bad_uid = BlockUid(3, 4)
+        for i in range(6):
+            version = self.database_backend.create_version(version_uid=VersionUid(f'v{i + 1}'),
+                                                           volume='backup-name',
+                                                           snapshot='snapshot-name.{}'.format(i),
+                                                           size=16 * 1024 * 4096,
+                                                           storage_id=1,
+                                                           block_size=4 * 1024 * 4096)
+            blocks = [{
+                'idx': 0,
+                'uid_left': bad_uid.left if i < 3 else good_uid.left,
+                'uid_right': bad_uid.right if i < 3 else good_uid.right,
+                'checksum': 'aabbcc',
+                'size': 4 * 1024 * 4096,
+                'valid': True,
+            }]
+            self.database_backend.create_blocks(version=version, blocks=blocks)
+            self.database_backend.commit()
+            self.database_backend.set_version(version_uid=version.uid, status=VersionStatus.valid)
+
+            versions.append(version)
+
+        self.database_backend.set_block_invalid(bad_uid)
+
+        for i in range(3):
+            self.assertEqual(VersionStatus.invalid, versions[i].status)
+            self.assertFalse(versions[i].blocks[0].valid)
+
+        for i in range(3, 6):
+            self.assertEqual(VersionStatus.valid, versions[i].status)
+            self.assertTrue(versions[i].blocks[0].valid)
+
+    def test_version_num_blocks(self):
+        self.database_backend.sync_storage('s-1', storage_id=1)
+        for i in range(256):
+            version = self.database_backend.create_version(version_uid=f'v{i + 1}',
+                                                           volume='backup-name',
+                                                           snapshot='snapshot-name.{}'.format(i),
+                                                           size=i * 1111 * 4096,
+                                                           storage_id=1,
+                                                           block_size=4 * 1024 * 4096)
+            self.assertEqual(math.ceil(version.size / version.block_size), version.blocks_count)
 
 
 class DatabaseBackendTestSQLLite(DatabaseBackendTestCase, TestCase):

@@ -3,10 +3,13 @@ import json
 import os
 import random
 import unittest
+import uuid
 from functools import reduce
 from operator import and_
 from shutil import copyfile
 from unittest import TestCase
+
+from benji.database import VersionUid
 
 from benji.blockuidhistory import BlockUidHistory
 from benji.logging import logger
@@ -104,8 +107,9 @@ class SmokeTestCase(BenjiTestCaseBase):
             benji_obj = self.benjiOpen(init_database=init_database, block_size=block_size)
             init_database = False
             with open(os.path.join(testpath, 'hints')) as hints:
-                version = benji_obj.backup(version_name='data-backup',
-                                           version_snapshot_name='snapshot-name',
+                version = benji_obj.backup(version_uid=VersionUid(str(uuid.uuid4())),
+                                           volume='data-backup',
+                                           snapshot='snapshot-name',
                                            source='file:' + image_filename,
                                            hints=hints_from_rbd_diff(hints.read()) if base_version_uid else None,
                                            base_version_uid=base_version_uid,
@@ -133,8 +137,9 @@ class SmokeTestCase(BenjiTestCaseBase):
             logger.debug('Restore of version successful')
 
             benji_obj = self.benjiOpen()
-            blocks = list(benji_obj._database_backend.get_blocks_by_version(version_uid))
-            self.assertEqual(list(range(len(blocks))), sorted([block.id for block in blocks]))
+            version = benji_obj._database_backend.get_version(version_uid)
+            blocks = list(benji_obj._database_backend.get_blocks_by_version(version))
+            self.assertEqual(list(range(len(blocks))), sorted([block.idx for block in blocks]))
             self.assertTrue(len(blocks) > 0)
             if len(blocks) > 1:
                 self.assertTrue(reduce(and_, [block.size == block_size for block in blocks[:-1]]))
@@ -144,8 +149,8 @@ class SmokeTestCase(BenjiTestCaseBase):
             benji_obj = self.benjiOpen()
             versions = benji_obj.ls()
             self.assertEqual(set(), set([version.uid for version in versions]) ^ set(version_uids))
-            self.assertTrue(reduce(and_, [version.name == 'data-backup' for version in versions]))
-            self.assertTrue(reduce(and_, [version.snapshot_name == 'snapshot-name' for version in versions]))
+            self.assertTrue(reduce(and_, [version.volume == 'data-backup' for version in versions]))
+            self.assertTrue(reduce(and_, [version.snapshot == 'snapshot-name' for version in versions]))
             self.assertTrue(reduce(and_, [version.block_size == block_size for version in versions]))
             self.assertTrue(reduce(and_, [version.size > 0 for version in versions]))
             benji_obj.close()
@@ -177,12 +182,12 @@ class SmokeTestCase(BenjiTestCaseBase):
             logger.debug('Deep scrub with history successful')
 
             benji_obj = self.benjiOpen()
-            benji_obj.batch_scrub('uid == {}'.format(version_uid.integer), 100, 100)
+            benji_obj.batch_scrub('uid == "{}"'.format(version_uid), 100, 100)
             benji_obj.close()
             logger.debug('Batch scrub with history successful')
 
             benji_obj = self.benjiOpen()
-            benji_obj.batch_deep_scrub('uid == {}'.format(version_uid.integer), 100, 100)
+            benji_obj.batch_deep_scrub('uid == "{}"'.format(version_uid), 100, 100)
             benji_obj.close()
             logger.debug('Batch deep scrub with history successful')
 
@@ -221,7 +226,8 @@ class SmokeTestCase(BenjiTestCaseBase):
             # delete old versions
             if len(version_uids) > 10:
                 benji_obj = self.benjiOpen()
-                dismissed_versions = benji_obj.enforce_retention_policy('name=="data-backup"', 'latest10,hours24,days30')
+                dismissed_versions = benji_obj.enforce_retention_policy('volume == "data-backup"',
+                                                                        'latest10,hours24,days30')
                 for dismissed_version in dismissed_versions:
                     version_uids.remove(dismissed_version.uid)
                 benji_obj.close()
@@ -257,7 +263,6 @@ class SmokeTestCaseSQLLite_File(SmokeTestCase, TestCase):
             defaultStorage: s1
             storages:
             - name: s1
-              storageId: 1
               module: file
               configuration:
                 path: {testpath}/data
@@ -272,7 +277,67 @@ class SmokeTestCaseSQLLite_File(SmokeTestCase, TestCase):
                   kdfIterations: 1000
                   password: Hallo123
             - name: s2
-              storageId: 2
+              module: file
+              configuration:
+                path: {testpath}/data-2
+                consistencyCheckWrites: True
+                simultaneousWrites: 5
+                simultaneousReads: 5
+                activeTransforms:
+                  - zstd
+                  - k1
+                hmac:
+                  kdfSalt: BBiZ+lIVSefMCdE4eOPX211n/04KY1M4c2SM/9XHUcA=
+                  kdfIterations: 1000
+                  password: Hallo123
+            transforms:
+            - name: zstd
+              module: zstd
+              configuration:
+                level: 1
+            - name: k1
+              module: aes_256_gcm
+              configuration:
+                kdfSalt: BBiZ+lIVSefMCdE4eOPX211n/04KY1M4c2SM/9XHUcA=
+                kdfIterations: 20000
+                password: "this is a very secret password"
+            databaseEngine: sqlite:///{testpath}/benji.sqlite
+            """
+
+
+# Test for older configurations with hardcoded storage ids
+class SmokeTestCaseSQLLite_File_storageId(SmokeTestCase, TestCase):
+
+    CONFIG = """
+            configurationVersion: '1'
+            processName: benji
+            logFile: /dev/stderr
+            hashFunction: BLAKE2b,digest_bits=256
+            blockSize: 4096
+            ios:
+            - name: file
+              module: file
+              configuration:
+                simultaneousReads: 2
+            defaultStorage: s1
+            storages:
+            - name: s1
+              storageId: 11
+              module: file
+              configuration:
+                path: {testpath}/data
+                consistencyCheckWrites: True
+                simultaneousWrites: 5
+                simultaneousReads: 5
+                activeTransforms:
+                  - zstd
+                  - k1
+                hmac:
+                  kdfSalt: BBiZ+lIVSefMCdE4eOPX211n/04KY1M4c2SM/9XHUcA=
+                  kdfIterations: 1000
+                  password: Hallo123
+            - name: s2
+              storageId: 22
               module: file
               configuration:
                 path: {testpath}/data-2
@@ -318,7 +383,6 @@ class SmokeTestCasePostgreSQL_File(SmokeTestCase, TestCase):
             defaultStorage: s1
             storages:
             - name: s1
-              storageId: 1
               module: file
               configuration:
                 path: {testpath}/data
@@ -334,7 +398,6 @@ class SmokeTestCasePostgreSQL_File(SmokeTestCase, TestCase):
                   kdfIterations: 1000
                   password: Hallo123
             - name: s2
-              storageId: 2
               module: file
               configuration:
                 path: {testpath}/data-2
@@ -383,7 +446,6 @@ class SmokeTestCasePostgreSQL_S3(SmokeTestCase, TestCase):
             defaultStorage: s1
             storages:
             - name: s1
-              storageId: 1
               module: s3
               configuration:
                 awsAccessKeyId: minio
@@ -404,7 +466,6 @@ class SmokeTestCasePostgreSQL_S3(SmokeTestCase, TestCase):
                   kdfIterations: 1000
                   password: Hallo123
             - name: s2
-              storageId: 2
               module: s3
               configuration:
                 awsAccessKeyId: minio
@@ -423,7 +484,7 @@ class SmokeTestCasePostgreSQL_S3(SmokeTestCase, TestCase):
                 hmac:
                   kdfSalt: BBiZ+lIVSefMCdE4eOPX211n/04KY1M4c2SM/9XHUcA=
                   kdfIterations: 1000
-                  password: Hallo123        
+                  password: Hallo123
             transforms:
             - name: zstd
               module: zstd
@@ -458,7 +519,6 @@ class SmokeTestCasePostgreSQL_S3_ReadCache(SmokeTestCase, TestCase):
             defaultStorage: s1
             storages:
             - name: s1
-              storageId: 1
               module: s3
               configuration:
                 awsAccessKeyId: minio
@@ -483,7 +543,6 @@ class SmokeTestCasePostgreSQL_S3_ReadCache(SmokeTestCase, TestCase):
                   maximumSize: 16777216
                   shards: 8
             - name: s2
-              storageId: 2
               module: s3
               configuration:
                 awsAccessKeyId: minio
@@ -541,7 +600,6 @@ class SmokeTestCasePostgreSQL_B2(SmokeTestCase):
             defaultStorage: s1
             storages:
             - name: s1
-              storageId: 1
               module: b2
               configuration:
                 accountIdFile: ../../../.b2-account-id.txt
@@ -560,7 +618,6 @@ class SmokeTestCasePostgreSQL_B2(SmokeTestCase):
                   kdfIterations: 1000
                   password: Hallo123
             - name: s2
-              storageId: 2
               module: b2
               configuration:
                 accountIdFile: ../../../.b2-account-id.txt
@@ -577,7 +634,7 @@ class SmokeTestCasePostgreSQL_B2(SmokeTestCase):
                 hmac:
                   kdfSalt: BBiZ+lIVSefMCdE4eOPX211n/04KY1M4c2SM/9XHUcA=
                   kdfIterations: 1000
-                  password: Hallo123        
+                  password: Hallo123
             transforms:
             - name: zstd
               module: zstd

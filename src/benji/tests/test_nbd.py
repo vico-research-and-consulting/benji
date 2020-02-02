@@ -4,6 +4,7 @@ import re
 import subprocess
 import threading
 import unittest
+import uuid
 from unittest import TestCase
 
 from benji.benji import BenjiStore
@@ -47,7 +48,11 @@ class NbdTestCase:
             self.patch(image_filename, offset, data)
 
         benji_obj = self.benjiOpen(init_database=True)
-        version_uid = benji_obj.backup('data-backup', 'snapshot-name', 'file:' + image_filename, None, None)
+        version = benji_obj.backup(version_uid=str(uuid.uuid4()),
+                                   volume='data-backup',
+                                   snapshot='snapshot-name',
+                                   source='file:' + image_filename)
+        version_uid = version.uid
         benji_obj.close()
         return version_uid, size
 
@@ -98,12 +103,12 @@ class NbdTestCase:
         self.subprocess_run(
             args=['sudo', 'nbd-client', '127.0.0.1', '-p',
                   str(self.SERVER_PORT), '-l'],
-            success_regexp='^Negotiation: ..\n{}\n$'.format(version_uid[0].v_string))
+            success_regexp='^Negotiation: ..\n{}\n$'.format(version_uid[0]))
 
         version_uid, size = version_uid
         self.subprocess_run(
             args=[
-                'sudo', 'nbd-client', '-N', version_uid.v_string, '127.0.0.1', '-p',
+                'sudo', 'nbd-client', '-N', version_uid, '127.0.0.1', '-p',
                 str(self.SERVER_PORT), self.NBD_DEVICE
             ],
             success_regexp='^Negotiation: ..size = \d+MB\nbs=1024, sz=\d+ bytes\n$|^Negotiation: ..size = \d+MB|Connected /dev/nbd\d+$')
@@ -192,7 +197,10 @@ class NbdTestCaseSQLLite_File(NbdTestCase, BenjiTestCaseBase, TestCase):
                 password: "this is a very secret password"
             databaseEngine: sqlite:///{testpath}/benji.sqlite
             nbd:
-              cacheDirectory: {testpath}/nbd-cache
+              blockCache:
+                directory: {testpath}/nbd/block-cache
+              cowStore:
+                directory: {testpath}/nbd/cow-store
             """
 
 
@@ -248,5 +256,8 @@ class NbdTestCasePostgreSQL_S3(NbdTestCase, BenjiTestCaseBase, TestCase):
                 password: "this is a very secret password"
             databaseEngine: postgresql://benji:verysecret@localhost:15432/benji
             nbd:
-              cacheDirectory: {testpath}/nbd-cache
+              blockCache:
+                directory: {testpath}/nbd/block-cache
+              cowStore:
+                directory: {testpath}/nbd/cow-store
             """
